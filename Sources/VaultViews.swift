@@ -1,20 +1,205 @@
 import SwiftUI
 import Photos
 import PhotosUI
+import AVKit
 import UniformTypeIdentifiers
+
+// MARK: - Presentation specs
+
+struct NoteSpec: Identifiable {
+    let id = UUID()
+    let item: VaultItem?
+    let parent: UUID?
+}
+
+struct MoveSpec: Identifiable {
+    let id = UUID()
+    let ids: Set<UUID>
+    let onDone: () -> Void
+}
+
+enum Cover: Identifiable {
+    case media(ViewerSpec)
+    case preview(URLBox)
+    case camera(UUID?)
+    case scanner(UUID?)
+
+    var id: String {
+        switch self {
+        case .media(let s): return "m" + s.id.uuidString
+        case .preview(let b): return "p" + b.id.uuidString
+        case .camera: return "camera"
+        case .scanner: return "scanner"
+        }
+    }
+}
+
+enum SheetKind: Identifiable {
+    case note(NoteSpec)
+    case tags(VaultItem)
+    case share(ShareBox)
+    case move(MoveSpec)
+
+    var id: String {
+        switch self {
+        case .note(let s): return "n" + s.id.uuidString
+        case .tags(let i): return "t" + i.id.uuidString
+        case .share(let b): return "s" + b.id.uuidString
+        case .move(let m): return "mv" + m.id.uuidString
+        }
+    }
+}
+
+// MARK: - Presenter
+
+@MainActor
+final class Presenter: ObservableObject {
+    @Published var cover: Cover?
+    @Published var sheet: SheetKind?
+
+    func open(_ item: VaultItem, in list: [VaultItem], store: VaultStore) {
+        if item.isNote {
+            sheet = .note(NoteSpec(item: item, parent: item.parent))
+            return
+        }
+        if item.isMedia {
+            let media = list.filter { $0.isMedia }
+            let idx = media.firstIndex(where: { $0.id == item.id }) ?? 0
+            cover = .media(ViewerSpec(items: media.isEmpty ? [item] : media, start: idx))
+            return
+        }
+        Task { @MainActor in
+            store.busy = true
+            store.busyText = "جاري التجهيز…"
+            if let url = try? await store.exportURL(for: item) {
+                cover = .preview(URLBox(url: url))
+            }
+            store.busy = false
+        }
+    }
+
+    func share(_ items: [VaultItem], store: VaultStore) {
+        let files = items.filter { !$0.isFolder && !$0.isNote }
+        guard !files.isEmpty else { return }
+        Task { @MainActor in
+            store.busy = true
+            store.busyText = "جاري التجهيز…"
+            var urls: [URL] = []
+            for f in files {
+                if let u = try? await store.exportURL(for: f) { urls.append(u) }
+            }
+            store.busy = false
+            if !urls.isEmpty { sheet = .share(ShareBox(urls: urls)) }
+        }
+    }
+}
+
+struct Presentations: ViewModifier {
+    @ObservedObject var p: Presenter
+    @EnvironmentObject var store: VaultStore
+
+    func body(content: Content) -> some View {
+        content
+            .fullScreenCover(item: $p.cover) { c in
+                switch c {
+                case .media(let spec):
+                    MediaViewer(spec: spec)
+                case .preview(let box):
+                    QuickLookView(url: box.url) { p.cover = nil }
+                        .ignoresSafeArea()
+                case .camera(let parent):
+                    CameraPicker { data in
+                        p.cover = nil
+                        if let d = data {
+                            let f = DateFormatter()
+                            f.dateFormat = "yyyyMMdd_HHmmss"
+                            let name = "IMG_" + f.string(from: Date()) + ".jpg"
+                            Task { await store.importData(d, name: name, parent: parent) }
+                        }
+                    }
+                    .ignoresSafeArea()
+                case .scanner(let parent):
+                    DocumentScanner { imgs in
+                        p.cover = nil
+                        guard !imgs.isEmpty else { return }
+                        let data = PDFTools.pdfData(from: imgs)
+                        let f = DateFormatter()
+                        f.dateFormat = "yyyy-MM-dd HH.mm"
+                        let name = "مسح " + f.string(from: Date()) + ".pdf"
+                        Task { await store.importData(data, name: name, parent: parent) }
+                    }
+                    .ignoresSafeArea()
+                }
+            }
+            .sheet(item: $p.sheet) { s in
+                switch s {
+                case .note(let spec):
+                    NoteEditor(spec: spec)
+                case .tags(let it):
+                    TagsSheet(item: it)
+                case .share(let b):
+                    ShareSheet(urls: b.urls)
+                case .move(let m):
+                    MoveSheet(spec: m)
+                }
+            }
+    }
+}
+
+extension View {
+    func presentations(_ p: Presenter) -> some View {
+        modifier(Presentations(p: p))
+    }
+
+    func folderDestinations() -> some View {
+        navigationDestination(for: UUID.self) { id in
+            FolderView(parent: id)
+        }
+    }
+}
 
 // MARK: - Root
 
 struct VaultRoot: View {
     @EnvironmentObject var store: VaultStore
+    @State private var tab = 0
 
     var body: some View {
-        NavigationStack {
-            FolderView(parent: nil)
-                .navigationDestination(for: UUID.self) { id in
-                    FolderView(parent: id)
-                }
+        TabView(selection: $tab) {
+            NavigationStack {
+                FolderView(parent: nil)
+                    .folderDestinations()
+            }
+            .tabItem { Label("الملفات", systemImage: "folder.fill") }
+            .tag(0)
+
+            NavigationStack {
+                MediaTab()
+            }
+            .tabItem { Label("الوسائط", systemImage: "photo.stack.fill") }
+            .tag(1)
+
+            NavigationStack {
+                FavoritesTab()
+                    .folderDestinations()
+            }
+            .tabItem { Label("المفضلة", systemImage: "star.fill") }
+            .tag(2)
+
+            NavigationStack {
+                NotesTab()
+            }
+            .tabItem { Label("الملاحظات", systemImage: "note.text") }
+            .tag(3)
+
+            NavigationStack {
+                SettingsTab()
+            }
+            .tabItem { Label("الإعدادات", systemImage: "gearshape.fill") }
+            .tag(4)
         }
+        .tint(Theme.accent)
+        .environment(\.layoutDirection, .rightToLeft)
         .overlay {
             if store.busy { BusyOverlay(text: store.busyText) }
         }
@@ -26,58 +211,13 @@ struct VaultRoot: View {
     }
 }
 
-struct BusyOverlay: View {
-    let text: String
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.55).ignoresSafeArea()
-            VStack(spacing: 14) {
-                ProgressView().tint(.white).scaleEffect(1.3)
-                Text(text).font(.callout).foregroundColor(.white)
-            }
-            .padding(26)
-            .background(RoundedRectangle(cornerRadius: 16).fill(Color(white: 0.15)))
-        }
-    }
-}
-
-// MARK: - Enums for presentation
-
-enum Cover: Identifiable {
-    case image(ViewerSpec)
-    case preview(URLBox)
-    case camera
-
-    var id: String {
-        switch self {
-        case .image(let s): return "i" + s.id.uuidString
-        case .preview(let b): return "p" + b.id.uuidString
-        case .camera: return "camera"
-        }
-    }
-}
-
-enum SheetKind: Identifiable {
-    case settings
-    case move
-    case share(ShareBox)
-
-    var id: String {
-        switch self {
-        case .settings: return "settings"
-        case .move: return "move"
-        case .share(let b): return "s" + b.id.uuidString
-        }
-    }
-}
-
 // MARK: - Folder view
 
 struct FolderView: View {
     let parent: UUID?
 
     @EnvironmentObject var store: VaultStore
-    @EnvironmentObject var app: AppState
+    @StateObject private var p = Presenter()
 
     @State private var selecting = false
     @State private var selection = Set<UUID>()
@@ -88,45 +228,63 @@ struct FolderView: View {
     @State private var newFolderName = ""
     @State private var renameTarget: VaultItem?
     @State private var renameText = ""
-    @State private var confirmDelete = false
-    @State private var cover: Cover?
-    @State private var sheet: SheetKind?
     @State private var query = ""
     @AppStorage("calc.sort") private var sortRaw: String = SortMode.name.rawValue
 
     private var sort: SortMode { SortMode(rawValue: sortRaw) ?? .name }
 
-    private let cols = [GridItem(.adaptive(minimum: 100), spacing: 12)]
+    private let cols = [GridItem(.adaptive(minimum: 104), spacing: 12)]
 
     private var title: String {
-        if let p = parent, let it = store.item(p) { return it.name }
-        return "المحفوظات"
+        if let pid = parent, let it = store.item(pid) { return it.name }
+        return "الملفات"
     }
 
     var body: some View {
         let searching = !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let list = searching ? store.search(query) : store.children(of: parent, sort: sort)
+        let folders = list.filter { $0.isFolder }
+        let files = list.filter { !$0.isFolder }
+
         ScrollView {
             if list.isEmpty {
-                VStack(spacing: 10) {
-                    Image(systemName: searching ? "magnifyingglass" : "tray")
-                        .font(.system(size: 44)).foregroundColor(.secondary)
-                    Text(searching ? "ما فيه نتائج" : "فاضي — اضغط + للإضافة").foregroundColor(.secondary)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.top, 120)
+                EmptyState(
+                    icon: searching ? "magnifyingglass" : "tray.fill",
+                    text: searching ? "ما فيه نتائج" : "فاضي — اضغط + للإضافة"
+                )
             }
-            LazyVGrid(columns: cols, spacing: 14) {
-                ForEach(list) { item in
-                    cell(item, list: list)
+            if !folders.isEmpty {
+                SectionTitle(title: "المجلدات", count: folders.count)
+                LazyVGrid(columns: cols, spacing: 14) {
+                    ForEach(folders) { item in
+                        cell(item, list: list)
+                    }
                 }
+                .padding(.horizontal, 14)
+                .padding(.bottom, 8)
             }
-            .padding(12)
+            if !files.isEmpty {
+                SectionTitle(title: "الملفات", count: files.count)
+                LazyVGrid(columns: cols, spacing: 14) {
+                    ForEach(files) { item in
+                        cell(item, list: list)
+                    }
+                }
+                .padding(.horizontal, 14)
+            }
+            Color.clear.frame(height: 90)
         }
+        .background(AppBackground())
         .navigationTitle(title)
-        .navigationBarTitleDisplayMode(.inline)
+        .navigationBarTitleDisplayMode(parent == nil ? .large : .inline)
         .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "بحث")
         .toolbar { toolbarContent }
+        .overlay(alignment: .bottomLeading) {
+            if !selecting { fab }
+        }
+        .safeAreaInset(edge: .bottom) {
+            if selecting { selectionBar }
+        }
         .photosPicker(isPresented: $showPhotos, selection: $pickerItems, maxSelectionCount: 100,
                       matching: .any(of: [.images, .videos]), photoLibrary: .shared())
         .onChange(of: pickerItems) { picks in importPicked(picks) }
@@ -154,41 +312,7 @@ struct FolderView: View {
             }
             Button("إلغاء", role: .cancel) { renameTarget = nil }
         }
-        .confirmationDialog("حذف \(selection.count) عنصر نهائياً؟", isPresented: $confirmDelete, titleVisibility: .visible) {
-            Button("حذف", role: .destructive) {
-                store.delete(selection)
-                selection.removeAll()
-                selecting = false
-            }
-        }
-        .fullScreenCover(item: $cover) { c in
-            switch c {
-            case .image(let spec):
-                ImageViewer(spec: spec)
-            case .preview(let box):
-                QuickLookView(url: box.url) { cover = nil }
-                    .ignoresSafeArea()
-            case .camera:
-                CameraPicker { data in
-                    cover = nil
-                    if let d = data { importCamera(d) }
-                }
-                .ignoresSafeArea()
-            }
-        }
-        .sheet(item: $sheet) { s in
-            switch s {
-            case .settings:
-                SettingsView()
-            case .move:
-                MoveSheet(ids: selection) {
-                    selection.removeAll()
-                    selecting = false
-                }
-            case .share(let box):
-                ShareSheet(urls: box.urls)
-            }
-        }
+        .presentations(p)
     }
 
     // MARK: toolbar
@@ -196,19 +320,10 @@ struct FolderView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         ToolbarItem(placement: .navigationBarLeading) {
-            if parent == nil {
-                HStack(spacing: 16) {
-                    Button { app.lock() } label: { Image(systemName: "lock.fill") }
-                    Button { sheet = .settings } label: { Image(systemName: "gearshape") }
-                }
-            }
+            if parent == nil { LockButton() }
         }
         ToolbarItem(placement: .navigationBarTrailing) {
-            HStack(spacing: 16) {
-                Button(selecting ? "إلغاء" : "تحديد") {
-                    selecting.toggle()
-                    selection.removeAll()
-                }
+            HStack(spacing: 14) {
                 Menu {
                     Picker("ترتيب", selection: $sortRaw) {
                         ForEach(SortMode.allCases) { m in
@@ -218,29 +333,65 @@ struct FolderView: View {
                 } label: {
                     Image(systemName: "arrow.up.arrow.down.circle")
                 }
-                Menu {
-                    Button { showNewFolder = true } label: { Label("مجلد جديد", systemImage: "folder.badge.plus") }
-                    Button { showPhotos = true } label: { Label("من الصور", systemImage: "photo.on.rectangle") }
-                    Button { showFiles = true } label: { Label("من الملفات", systemImage: "doc.badge.plus") }
-                    if UIImagePickerController.isSourceTypeAvailable(.camera) {
-                        Button { cover = .camera } label: { Label("تصوير", systemImage: "camera") }
-                    }
-                } label: {
-                    Image(systemName: "plus.circle.fill")
+                Button(selecting ? "إلغاء" : "تحديد") {
+                    selecting.toggle()
+                    selection.removeAll()
                 }
             }
         }
-        ToolbarItemGroup(placement: .bottomBar) {
-            if selecting {
-                Button { shareItems(selectedItems()) } label: { Image(systemName: "square.and.arrow.up") }
-                    .disabled(selection.isEmpty)
-                Spacer()
-                Button { sheet = .move } label: { Image(systemName: "folder") }
-                    .disabled(selection.isEmpty)
-                Spacer()
-                Button(role: .destructive) { confirmDelete = true } label: { Image(systemName: "trash") }
-                    .disabled(selection.isEmpty)
+    }
+
+    private var fab: some View {
+        Menu {
+            Button { showNewFolder = true } label: { Label("مجلد جديد", systemImage: "folder.badge.plus") }
+            Button { p.sheet = .note(NoteSpec(item: nil, parent: parent)) } label: { Label("ملاحظة جديدة", systemImage: "note.text.badge.plus") }
+            Button { showPhotos = true } label: { Label("من الصور", systemImage: "photo.on.rectangle") }
+            Button { showFiles = true } label: { Label("من الملفات", systemImage: "doc.badge.plus") }
+            if UIImagePickerController.isSourceTypeAvailable(.camera) {
+                Button { p.cover = .camera(parent) } label: { Label("تصوير", systemImage: "camera") }
             }
+            if DocumentScanner.isSupported {
+                Button { p.cover = .scanner(parent) } label: { Label("مسح مستند (PDF)", systemImage: "doc.viewfinder") }
+            }
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 24, weight: .bold))
+                .foregroundColor(.white)
+                .frame(width: 60, height: 60)
+                .background(Theme.gradient, in: Circle())
+                .shadow(color: Theme.accent.opacity(0.45), radius: 12, x: 0, y: 6)
+        }
+        .padding(20)
+    }
+
+    private var selectionBar: some View {
+        HStack(spacing: 30) {
+            barButton("square.and.arrow.up") { p.share(selectedItems(), store: store) }
+            barButton("star") {
+                for id in selection { store.setFav(id, true) }
+                exitSelect()
+            }
+            barButton("folder") {
+                p.sheet = .move(MoveSpec(ids: selection, onDone: { exitSelect() }))
+            }
+            barButton("trash", destructive: true) {
+                store.trash(selection)
+                exitSelect()
+            }
+        }
+        .padding(.horizontal, 26)
+        .padding(.vertical, 14)
+        .background(.ultraThinMaterial, in: Capsule())
+        .padding(.bottom, 6)
+        .opacity(selection.isEmpty ? 0.5 : 1)
+        .disabled(selection.isEmpty)
+    }
+
+    private func barButton(_ icon: String, destructive: Bool = false, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundColor(destructive ? .red : Theme.accent)
         }
     }
 
@@ -248,20 +399,21 @@ struct FolderView: View {
 
     @ViewBuilder
     private func cell(_ item: VaultItem, list: [VaultItem]) -> some View {
+        let sel = selection.contains(item.id)
         if selecting {
-            ItemTile(item: item, selected: selection.contains(item.id))
+            ItemTile(item: item, selected: sel, count: store.folderCount(item.id))
                 .onTapGesture {
-                    if selection.contains(item.id) { selection.remove(item.id) } else { selection.insert(item.id) }
+                    if sel { selection.remove(item.id) } else { selection.insert(item.id) }
                 }
         } else if item.isFolder {
             NavigationLink(value: item.id) {
-                ItemTile(item: item, selected: false)
+                ItemTile(item: item, selected: false, count: store.folderCount(item.id))
             }
             .buttonStyle(.plain)
             .contextMenu { menu(for: item) }
         } else {
-            ItemTile(item: item, selected: false)
-                .onTapGesture { open(item, list: list) }
+            ItemTile(item: item, selected: false, count: 0)
+                .onTapGesture { p.open(item, in: list, store: store) }
                 .contextMenu { menu(for: item) }
         }
     }
@@ -273,18 +425,25 @@ struct FolderView: View {
             renameTarget = item
         } label: { Label("إعادة تسمية", systemImage: "pencil") }
 
+        Button { store.toggleFav(item.id) } label: {
+            Label(item.isFavorite ? "إزالة من المفضلة" : "إضافة للمفضلة",
+                  systemImage: item.isFavorite ? "star.slash" : "star")
+        }
+
+        Button { p.sheet = .tags(item) } label: { Label("وسوم", systemImage: "tag") }
+
         Button {
-            selection = [item.id]
-            sheet = .move
+            p.sheet = .move(MoveSpec(ids: [item.id], onDone: {}))
         } label: { Label("نقل", systemImage: "folder") }
 
-        if !item.isFolder {
-            Button { shareItems([item]) } label: { Label("مشاركة / حفظ خارجي", systemImage: "square.and.arrow.up") }
+        if !item.isFolder && !item.isNote {
+            Button { p.share([item], store: store) } label: {
+                Label("مشاركة / حفظ خارجي", systemImage: "square.and.arrow.up")
+            }
         }
 
         Button(role: .destructive) {
-            selection = [item.id]
-            confirmDelete = true
+            store.trash([item.id])
         } label: { Label("حذف", systemImage: "trash") }
     }
 
@@ -294,36 +453,9 @@ struct FolderView: View {
         selection.compactMap { store.item($0) }
     }
 
-    private func open(_ item: VaultItem, list: [VaultItem]) {
-        if item.isImage {
-            let imgs = list.filter { $0.isImage }
-            let idx = imgs.firstIndex(where: { $0.id == item.id }) ?? 0
-            cover = .image(ViewerSpec(items: imgs, start: idx))
-        } else {
-            Task { @MainActor in
-                store.busy = true
-                store.busyText = "جاري التجهيز…"
-                if let url = try? await store.exportURL(for: item) {
-                    cover = .preview(URLBox(url: url))
-                }
-                store.busy = false
-            }
-        }
-    }
-
-    private func shareItems(_ its: [VaultItem]) {
-        let files = its.filter { !$0.isFolder }
-        guard !files.isEmpty else { return }
-        Task { @MainActor in
-            store.busy = true
-            store.busyText = "جاري التجهيز…"
-            var urls: [URL] = []
-            for f in files {
-                if let u = try? await store.exportURL(for: f) { urls.append(u) }
-            }
-            store.busy = false
-            if !urls.isEmpty { sheet = .share(ShareBox(urls: urls)) }
-        }
+    private func exitSelect() {
+        selection.removeAll()
+        selecting = false
     }
 
     private func importPicked(_ picks: [PhotosPickerItem]) {
@@ -336,10 +468,10 @@ struct FolderView: View {
             store.busyText = "جاري التحميل…"
             var urls: [URL] = []
             var idFor: [URL: String] = [:]
-            for p in picks {
-                if let f = try? await p.loadTransferable(type: PickedFile.self) {
+            for pick in picks {
+                if let f = try? await pick.loadTransferable(type: PickedFile.self) {
                     urls.append(f.url)
-                    if let id = p.itemIdentifier { idFor[f.url] = id }
+                    if let id = pick.itemIdentifier { idFor[f.url] = id }
                 }
             }
             let ok = await store.importURLs(urls, parent: target)
@@ -349,79 +481,118 @@ struct FolderView: View {
             }
         }
     }
+}
 
-    private func importCamera(_ data: Data) {
-        let target = parent
-        let f = DateFormatter()
-        f.dateFormat = "yyyyMMdd_HHmmss"
-        let name = "IMG_" + f.string(from: Date()) + ".jpg"
-        Task { @MainActor in
-            await store.importData(data, name: name, parent: target)
+// MARK: - Tiles
+
+struct ThumbView: View {
+    let item: VaultItem
+    @EnvironmentObject var store: VaultStore
+    @State private var img: UIImage?
+
+    var body: some View {
+        ZStack {
+            if let img {
+                Image(uiImage: img)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Color.white.opacity(0.05)
+                Image(systemName: Kind.icon(for: item))
+                    .font(.system(size: 30))
+                    .foregroundStyle(Theme.gradient)
+            }
+            if item.isVideo {
+                Image(systemName: "play.circle.fill")
+                    .font(.title)
+                    .foregroundColor(.white.opacity(0.92))
+                    .shadow(radius: 3)
+            }
+        }
+        .task(id: item.id) {
+            if img == nil && item.isMedia {
+                img = await store.loadThumb(item.id)
+            }
         }
     }
 }
-
-// MARK: - Tile
 
 struct ItemTile: View {
     let item: VaultItem
     let selected: Bool
-    @EnvironmentObject var store: VaultStore
-    @State private var thumb: UIImage?
+    let count: Int
+
+    private var subtitle: String {
+        if item.isFolder { return "\(count) عنصر" }
+        return ByteCountFormatter.string(fromByteCount: item.size, countStyle: .file)
+    }
 
     var body: some View {
-        VStack(spacing: 6) {
-            ZStack(alignment: .topTrailing) {
-                RoundedRectangle(cornerRadius: 12)
-                    .fill(Color(white: 0.16))
-                    .aspectRatio(1, contentMode: .fit)
-                    .overlay { content }
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                if selected {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.title3)
-                        .foregroundStyle(.white, .blue)
-                        .padding(6)
+        VStack(spacing: 8) {
+            Color.clear
+                .aspectRatio(1, contentMode: .fit)
+                .overlay { preview }
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(selected ? Theme.accent : Theme.stroke, lineWidth: selected ? 3 : 1)
+                )
+                .overlay(alignment: .topLeading) {
+                    if selected {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.title3)
+                            .foregroundStyle(.white, Theme.accent)
+                            .padding(7)
+                    }
                 }
+                .overlay(alignment: .topTrailing) {
+                    if item.isFavorite {
+                        Image(systemName: "star.fill")
+                            .font(.caption)
+                            .foregroundColor(.yellow)
+                            .padding(7)
+                            .shadow(radius: 2)
+                    }
+                }
+
+            VStack(spacing: 2) {
+                Text(item.name)
+                    .font(.footnote.weight(.medium))
+                    .lineLimit(1)
+                    .foregroundColor(.primary)
+                Text(subtitle)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
             }
-            Text(item.name)
-                .font(.caption)
-                .lineLimit(2)
-                .multilineTextAlignment(.center)
-                .foregroundColor(.primary)
         }
         .contentShape(Rectangle())
-        .task(id: item.id) {
-            if thumb == nil && (item.isImage || item.isVideo) {
-                thumb = await store.loadThumb(item.id)
-            }
-        }
     }
 
     @ViewBuilder
-    private var content: some View {
-        if let t = thumb {
+    private var preview: some View {
+        if item.isFolder {
             ZStack {
-                Image(uiImage: t).resizable().scaledToFill()
-                if item.isVideo {
-                    Image(systemName: "play.circle.fill")
-                        .font(.title)
-                        .foregroundColor(.white.opacity(0.9))
-                }
+                LinearGradient(colors: [Theme.folderTop.opacity(0.22), Theme.folderBottom.opacity(0.10)],
+                               startPoint: .top, endPoint: .bottom)
+                Image(systemName: "folder.fill")
+                    .font(.system(size: 46))
+                    .foregroundStyle(Theme.folderGradient)
+                    .shadow(color: Theme.folderBottom.opacity(0.4), radius: 8, y: 4)
             }
         } else {
-            Image(systemName: Kind.icon(for: item))
-                .font(.system(size: 34))
-                .foregroundColor(item.isFolder ? .yellow : .secondary)
+            ThumbView(item: item)
+                .clipped()
         }
     }
 }
 
-// MARK: - Image viewer
+// MARK: - Media viewer (صور + فيديو)
 
-struct ImageViewer: View {
+struct MediaViewer: View {
     let spec: ViewerSpec
     @State private var index: Int
+    @State private var shareBox: ShareBox?
+    @EnvironmentObject var store: VaultStore
     @Environment(\.dismiss) private var dismiss
 
     init(spec: ViewerSpec) {
@@ -429,24 +600,111 @@ struct ImageViewer: View {
         _index = State(initialValue: spec.start)
     }
 
+    private var current: VaultItem {
+        spec.items[min(max(index, 0), spec.items.count - 1)]
+    }
+
+    private var isFav: Bool {
+        store.item(current.id)?.isFavorite ?? false
+    }
+
     var body: some View {
-        ZStack(alignment: .topLeading) {
+        ZStack {
             Color.black.ignoresSafeArea()
+
             TabView(selection: $index) {
                 ForEach(Array(spec.items.enumerated()), id: \.offset) { pair in
-                    ZoomableImage(item: pair.element).tag(pair.offset)
+                    Group {
+                        if pair.element.isVideo {
+                            VideoPage(item: pair.element, active: pair.offset == index)
+                        } else {
+                            ZoomableImage(item: pair.element)
+                        }
+                    }
+                    .tag(pair.offset)
                 }
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
             .ignoresSafeArea()
 
-            Button { dismiss() } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .font(.title)
-                    .foregroundColor(.white.opacity(0.8))
-                    .padding()
+            VStack {
+                HStack {
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.title)
+                            .symbolRenderingMode(.palette)
+                            .foregroundStyle(.white, Color.white.opacity(0.25))
+                    }
+                    Spacer()
+                    Text("\(index + 1) / \(spec.items.count)")
+                        .font(.footnote.weight(.semibold))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(.ultraThinMaterial, in: Capsule())
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+
+                Spacer()
+
+                HStack(spacing: 40) {
+                    Button { store.toggleFav(current.id) } label: {
+                        Image(systemName: isFav ? "star.fill" : "star")
+                            .foregroundColor(isFav ? .yellow : .white)
+                    }
+                    Button {
+                        Task {
+                            if let u = try? await store.exportURL(for: current) {
+                                shareBox = ShareBox(urls: [u])
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "square.and.arrow.up").foregroundColor(.white)
+                    }
+                    Button {
+                        store.trash([current.id])
+                        dismiss()
+                    } label: {
+                        Image(systemName: "trash").foregroundColor(.red)
+                    }
+                }
+                .font(.system(size: 22, weight: .semibold))
+                .padding(.horizontal, 30)
+                .padding(.vertical, 14)
+                .background(.ultraThinMaterial, in: Capsule())
+                .padding(.bottom, 18)
             }
         }
+        .sheet(item: $shareBox) { b in
+            ShareSheet(urls: b.urls)
+        }
+    }
+}
+
+struct VideoPage: View {
+    let item: VaultItem
+    let active: Bool
+    @EnvironmentObject var store: VaultStore
+    @State private var player: AVPlayer?
+
+    var body: some View {
+        ZStack {
+            if let player {
+                VideoPlayer(player: player)
+            } else {
+                ProgressView().tint(.white)
+            }
+        }
+        .task(id: active) {
+            if active {
+                if player == nil, let url = try? await store.exportURL(for: item) {
+                    player = AVPlayer(url: url)
+                }
+            } else {
+                player?.pause()
+            }
+        }
+        .onDisappear { player?.pause() }
     }
 }
 
@@ -514,19 +772,20 @@ struct ZoomableImage: View {
 // MARK: - Move
 
 struct MoveSheet: View {
-    let ids: Set<UUID>
-    let onDone: () -> Void
+    let spec: MoveSpec
     @EnvironmentObject var store: VaultStore
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             List {
-                Button { go(nil) } label: { Label("الرئيسية", systemImage: "house") }
-                ForEach(store.folderChoices(excluding: ids)) { c in
-                    Button { go(c.item.id) } label: { Label(c.path, systemImage: "folder") }
+                Button { go(nil) } label: { Label("الرئيسية", systemImage: "house.fill") }
+                ForEach(store.folderChoices(excluding: spec.ids)) { c in
+                    Button { go(c.item.id) } label: { Label(c.path, systemImage: "folder.fill") }
                 }
             }
+            .scrollContentBackground(.hidden)
+            .background(AppBackground())
             .navigationTitle("نقل إلى")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -538,94 +797,8 @@ struct MoveSheet: View {
     }
 
     private func go(_ target: UUID?) {
-        store.move(ids, to: target)
-        onDone()
+        store.move(spec.ids, to: target)
+        spec.onDone()
         dismiss()
-    }
-}
-
-// MARK: - Settings
-
-struct SettingsView: View {
-    @EnvironmentObject var store: VaultStore
-    @Environment(\.dismiss) private var dismiss
-    @State private var newCode = ""
-    @State private var confirm = ""
-    @State private var msg = ""
-    @State private var bio = Bio.enabled
-    @AppStorage("calc.delOrig") private var delOrig = false
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    SecureField("الرمز الجديد (٤ أرقام على الأقل)", text: $newCode)
-                        .keyboardType(.numberPad)
-                    SecureField("تأكيد الرمز", text: $confirm)
-                        .keyboardType(.numberPad)
-                    Button("حفظ الرمز") { saveCode() }
-                    if !msg.isEmpty {
-                        Text(msg).font(.footnote).foregroundColor(.secondary)
-                    }
-                } header: {
-                    Text("الرمز السري")
-                } footer: {
-                    Text("تكتب الرمز في الحاسبة وتضغط = لفتح الخزنة.")
-                }
-
-                if Bio.available {
-                    Section {
-                        Toggle("الفتح بالبصمة / الوجه", isOn: $bio)
-                    } footer: {
-                        Text("اضغط مطوّلاً على شاشة الأرقام في الحاسبة.")
-                    }
-                }
-
-                Section {
-                    Toggle("حذف الأصل من الصور بعد الاستيراد", isOn: $delOrig)
-                } footer: {
-                    Text("iOS يطلب تأكيدك قبل الحذف، والمحذوف يبقى ٣٠ يوم في «المحذوفة مؤخراً» في الصور — احذفه منها بنفسك.")
-                }
-
-                Section {
-                    LabeledContent("الحجم", value: ByteCountFormatter.string(fromByteCount: store.totalSize, countStyle: .file))
-                    LabeledContent("عدد الملفات", value: "\(store.items.filter { !$0.isFolder }.count)")
-                } header: {
-                    Text("التخزين")
-                }
-            }
-            .navigationTitle("الإعدادات")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button("تم") { dismiss() }
-                }
-            }
-            .onChange(of: bio) { v in
-                if v {
-                    Bio.authenticate { ok in
-                        if ok { Bio.enabled = true } else { bio = false }
-                    }
-                } else {
-                    Bio.enabled = false
-                }
-            }
-        }
-    }
-
-    private func saveCode() {
-        let digitsOnly = newCode.allSatisfy { "0123456789".contains($0) }
-        guard digitsOnly, newCode.count >= 4, newCode.count <= 12 else {
-            msg = "الرمز أرقام فقط، من ٤ إلى ١٢ رقم."
-            return
-        }
-        guard newCode == confirm else {
-            msg = "الرمزان غير متطابقين."
-            return
-        }
-        Passcode.set(newCode)
-        newCode = ""
-        confirm = ""
-        msg = "تم تغيير الرمز."
     }
 }

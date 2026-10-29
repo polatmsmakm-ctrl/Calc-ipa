@@ -28,6 +28,16 @@ targets:
           UIApplicationSupportsMultipleScenes: false
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIFileSharingEnabled: false
+        LSSupportsOpeningDocumentsInPlace: false
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: "Files"
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - public.data
+              - public.content
         NSFaceIDUsageDescription: "للتحقق من هويتك"
         NSCameraUsageDescription: "لالتقاط الصور"
         NSPhotoLibraryUsageDescription: "لحذف الصور الأصلية بعد نقلها"
@@ -36,3 +46,5 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.rashid.calc
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES: "IconNotes IconWeather IconClock"
+        ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS: YES

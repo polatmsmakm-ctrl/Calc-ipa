@@ -33,6 +33,15 @@ enum Keychain {
         guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess else { return nil }
         return out as? Data
     }
+
+    static func remove(_ name: String) {
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: name
+        ]
+        SecItemDelete(q as CFDictionary)
+    }
 }
 
 enum SecretStore {
@@ -57,39 +66,117 @@ enum SecretStore {
         }
     }
 
-    /// المفتاح الرئيسي للتشفير (256 بت) — يُنشأ مرة واحدة.
-    static func masterKey() -> SymmetricKey {
-        if let d = get("mk"), d.count == 32 { return SymmetricKey(data: d) }
+    static func remove(_ name: String) {
+        Keychain.remove(name)
+        try? FileManager.default.removeItem(at: fallbackDir.appendingPathComponent(".k_" + name))
+    }
+
+    /// مفتاح التشفير (256 بت) — يُنشأ مرة واحدة لكل خزنة (حقيقية / تمويه).
+    static func masterKey(_ name: String = "mk") -> SymmetricKey {
+        if let d = get(name), d.count == 32 { return SymmetricKey(data: d) }
         let k = SymmetricKey(size: .bits256)
         k.withUnsafeBytes { raw in
-            set(Data(raw), "mk")
+            set(Data(raw), name)
         }
         return k
     }
 }
 
-// MARK: - Passcode
+// MARK: - Passcodes (real / decoy / panic)
+
+enum PasscodeKind: String, CaseIterable {
+    case real = "pc"
+    case decoy = "pd"
+    case panic = "pp"
+}
 
 enum Passcode {
-    static var isSet: Bool { SecretStore.get("pc") != nil }
+    static func isSet(_ kind: PasscodeKind = .real) -> Bool {
+        SecretStore.get(kind.rawValue) != nil
+    }
 
-    static func set(_ code: String) {
+    static func set(_ code: String, kind: PasscodeKind = .real) {
         var salt = Data(count: 16)
         _ = salt.withUnsafeMutableBytes { buf -> Int32 in
             guard let base = buf.baseAddress else { return -1 }
             return SecRandomCopyBytes(kSecRandomDefault, 16, base)
         }
         let hash = Data(SHA256.hash(data: salt + Data(code.utf8)))
-        SecretStore.set(salt + hash, "pc")
+        SecretStore.set(salt + hash, kind.rawValue)
     }
 
-    static func verify(_ code: String) -> Bool {
-        guard let blob = SecretStore.get("pc"), blob.count == 48 else { return false }
+    static func clear(_ kind: PasscodeKind) {
+        SecretStore.remove(kind.rawValue)
+    }
+
+    static func verify(_ code: String, kind: PasscodeKind = .real) -> Bool {
+        guard let blob = SecretStore.get(kind.rawValue), blob.count == 48 else { return false }
         let bytes = Array(blob)
         let salt = Data(bytes[0..<16])
         let stored = Data(bytes[16..<48])
         let h = Data(SHA256.hash(data: salt + Data(code.utf8)))
         return h == stored
+    }
+
+    /// أي رمز يطابق الرقم المكتوب؟
+    static func match(_ code: String) -> PasscodeKind? {
+        for k in [PasscodeKind.real, .decoy, .panic] where isSet(k) && verify(code, kind: k) {
+            return k
+        }
+        return nil
+    }
+
+    /// هل الرمز مستخدم لنوع ثاني؟
+    static func conflicts(_ code: String, except: PasscodeKind) -> Bool {
+        for k in PasscodeKind.allCases where k != except && isSet(k) && verify(code, kind: k) {
+            return true
+        }
+        return false
+    }
+}
+
+// MARK: - Failed attempts / lockout / intruder log
+
+enum Attempts {
+    private static let d = UserDefaults.standard
+
+    static var consecutive: Int { d.integer(forKey: "calc.fails") }
+    static var total: Int { d.integer(forKey: "calc.failsTotal") }
+    static var last: Date? { d.object(forKey: "calc.failLast") as? Date }
+    static var lockUntil: Date? { d.object(forKey: "calc.lockUntil") as? Date }
+    static var shots: Int { d.integer(forKey: "calc.shots") }
+
+    static var isLocked: Bool {
+        if let u = lockUntil { return u > Date() }
+        return false
+    }
+
+    static func recordFail() {
+        let n = consecutive + 1
+        d.set(n, forKey: "calc.fails")
+        d.set(total + 1, forKey: "calc.failsTotal")
+        d.set(Date(), forKey: "calc.failLast")
+        if n >= 5 {
+            let mins = min(60, 1 << min(n - 5, 6))
+            d.set(Date().addingTimeInterval(Double(mins) * 60), forKey: "calc.lockUntil")
+        }
+    }
+
+    static func reset() {
+        d.set(0, forKey: "calc.fails")
+        d.removeObject(forKey: "calc.lockUntil")
+    }
+
+    static func recordShot() {
+        d.set(shots + 1, forKey: "calc.shots")
+    }
+
+    static func clearLog() {
+        d.set(0, forKey: "calc.fails")
+        d.set(0, forKey: "calc.failsTotal")
+        d.set(0, forKey: "calc.shots")
+        d.removeObject(forKey: "calc.failLast")
+        d.removeObject(forKey: "calc.lockUntil")
     }
 }
 
@@ -131,6 +218,30 @@ enum Crypto {
         return try AES.GCM.open(box, using: key)
     }
 
+    /// [4 bytes length LE][sealed box]
+    static func sealedFrame(_ plain: Data, key: SymmetricKey) throws -> Data {
+        let c = try encryptData(plain, key: key)
+        let n = c.count
+        var out = Data([
+            UInt8(n & 0xFF),
+            UInt8((n >> 8) & 0xFF),
+            UInt8((n >> 16) & 0xFF),
+            UInt8((n >> 24) & 0xFF)
+        ])
+        out.append(c)
+        return out
+    }
+
+    /// يقرأ إطاراً واحداً ويفك تشفيره. يرجع nil عند نهاية الملف.
+    static func readFrame(from h: FileHandle, key: SymmetricKey, maxLen: Int) throws -> Data? {
+        guard let headData = try h.read(upToCount: 4), headData.count == 4 else { return nil }
+        let b = Array(headData)
+        let len = Int(b[0]) | (Int(b[1]) << 8) | (Int(b[2]) << 16) | (Int(b[3]) << 24)
+        guard len > 0, len <= maxLen else { throw CryptoError.corrupt }
+        guard let blob = try h.read(upToCount: len), blob.count == len else { throw CryptoError.corrupt }
+        return try decryptData(blob, key: key)
+    }
+
     static func encryptFile(from src: URL, to dst: URL, key: SymmetricKey) throws {
         let fm = FileManager.default
         try? fm.removeItem(at: dst)
@@ -146,19 +257,26 @@ enum Crypto {
             try autoreleasepool { () throws -> Void in
                 let d = try inH.read(upToCount: chunkSize) ?? Data()
                 if d.isEmpty { done = true; return }
-                let c = try encryptData(d, key: key)
-                let n = c.count
-                let head = Data([
-                    UInt8(n & 0xFF),
-                    UInt8((n >> 8) & 0xFF),
-                    UInt8((n >> 16) & 0xFF),
-                    UInt8((n >> 24) & 0xFF)
-                ])
-                try outH.write(contentsOf: head)
-                try outH.write(contentsOf: c)
+                try outH.write(contentsOf: try sealedFrame(d, key: key))
             }
             if done { break }
         }
+    }
+
+    /// يحفظ بيانات صغيرة في الذاكرة كملف مشفّر بنفس الصيغة.
+    static func encryptDataToFile(_ d: Data, to dst: URL, key: SymmetricKey) throws {
+        var out = Data()
+        if d.isEmpty {
+            out = try sealedFrame(Data(), key: key)
+        } else {
+            var i = 0
+            while i < d.count {
+                let end = min(i + chunkSize, d.count)
+                out.append(try sealedFrame(d.subdata(in: i..<end), key: key))
+                i = end
+            }
+        }
+        try out.write(to: dst, options: .atomic)
     }
 
     static func decryptChunks(from src: URL, key: SymmetricKey, _ body: (Data) throws -> Void) throws {
@@ -167,15 +285,10 @@ enum Crypto {
         while true {
             var done = false
             try autoreleasepool { () throws -> Void in
-                guard let headData = try inH.read(upToCount: 4), headData.count == 4 else {
+                guard let plain = try readFrame(from: inH, key: key, maxLen: chunkSize + 64) else {
                     done = true
                     return
                 }
-                let h = Array(headData)
-                let len = Int(h[0]) | (Int(h[1]) << 8) | (Int(h[2]) << 16) | (Int(h[3]) << 24)
-                guard len > 0, len <= chunkSize + 64 else { throw CryptoError.corrupt }
-                guard let blob = try inH.read(upToCount: len), blob.count == len else { throw CryptoError.corrupt }
-                let plain = try decryptData(blob, key: key)
                 try body(plain)
             }
             if done { break }

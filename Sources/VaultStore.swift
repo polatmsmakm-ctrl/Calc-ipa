@@ -5,6 +5,8 @@ import ImageIO
 import PhotosUI
 import UniformTypeIdentifiers
 
+enum VaultMode { case real, decoy }
+
 // MARK: - Model
 
 struct VaultItem: Codable, Identifiable, Hashable {
@@ -15,15 +17,47 @@ struct VaultItem: Codable, Identifiable, Hashable {
     var size: Int64
     var date: Date
     var ext: String
+    var deletedAt: Date? = nil
+    var fav: Bool? = nil
+    var tags: [String]? = nil
 
     var isImage: Bool { !isFolder && Kind.isImage(ext) }
     var isVideo: Bool { !isFolder && Kind.isVideo(ext) }
+    var isMedia: Bool { isImage || isVideo }
+    var isNote: Bool { !isFolder && ext == "cnote" }
+    var isFavorite: Bool { fav ?? false }
 }
 
 struct FolderChoice: Identifiable {
     let item: VaultItem
     let path: String
     var id: UUID { item.id }
+}
+
+struct NoteField: Codable, Identifiable, Hashable {
+    var id = UUID()
+    var label: String
+    var value: String
+    var secret: Bool
+}
+
+struct NoteContent: Codable {
+    var body: String
+    var fields: [NoteField]
+}
+
+enum SortMode: String, CaseIterable, Identifiable {
+    case name, date, size
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .name: return "الاسم"
+        case .date: return "الأحدث"
+        case .size: return "الحجم"
+        }
+    }
 }
 
 enum Kind {
@@ -35,6 +69,7 @@ enum Kind {
 
     static func icon(for item: VaultItem) -> String {
         if item.isFolder { return "folder.fill" }
+        if item.isNote { return "note.text" }
         switch item.ext.lowercased() {
         case "pdf": return "doc.richtext"
         case "mp3", "m4a", "wav", "aac", "flac": return "waveform"
@@ -113,26 +148,12 @@ struct PickedFile: Transferable {
     }
 }
 
-// MARK: - Sort
-
-enum SortMode: String, CaseIterable, Identifiable {
-    case name, date, size
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .name: return "الاسم"
-        case .date: return "الأحدث"
-        case .size: return "الحجم"
-        }
-    }
-}
-
 // MARK: - Store
 
 @MainActor
 final class VaultStore: ObservableObject {
+    let mode: VaultMode
+
     @Published private(set) var items: [VaultItem] = []
     @Published var busy = false
     @Published var busyText = ""
@@ -146,16 +167,22 @@ final class VaultStore: ObservableObject {
         FileManager.default.temporaryDirectory.appendingPathComponent("vt", isDirectory: true)
     }
 
-    init() {
-        key = SecretStore.masterKey()
-        root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("CalcCache", isDirectory: true)
+    nonisolated static func rootURL(_ mode: VaultMode) -> URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(mode == .real ? "CalcCache" : "CalcCache2", isDirectory: true)
+    }
+
+    init(mode: VaultMode) {
+        self.mode = mode
+        key = SecretStore.masterKey(mode == .real ? "mk" : "mk2")
+        root = VaultStore.rootURL(mode)
         let fm = FileManager.default
-        for sub in ["files", "thumbs"] {
+        for sub in ["files", "thumbs", "inbox"] {
             try? fm.createDirectory(at: root.appendingPathComponent(sub), withIntermediateDirectories: true)
         }
         try? fm.removeItem(at: VaultStore.tempDir)
         loadIndex()
+        if mode == .real { ingestStaged() }
     }
 
     // MARK: paths
@@ -191,10 +218,16 @@ final class VaultStore: ObservableObject {
         try? c.write(to: indexURL, options: .atomic)
     }
 
+    private func index(of id: UUID) -> Int? {
+        items.firstIndex { $0.id == id }
+    }
+
     // MARK: queries
 
+    private var live: [VaultItem] { items.filter { $0.deletedAt == nil } }
+
     func children(of parent: UUID?, sort: SortMode = .name) -> [VaultItem] {
-        items.filter { $0.parent == parent }.sorted { a, b in
+        live.filter { $0.parent == parent }.sorted { a, b in
             if a.isFolder != b.isFolder { return a.isFolder }
             switch sort {
             case .name:
@@ -208,12 +241,54 @@ final class VaultStore: ObservableObject {
         }
     }
 
+    func folderCount(_ id: UUID) -> Int {
+        live.filter { $0.parent == id }.count
+    }
+
     func search(_ query: String) -> [VaultItem] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return [] }
-        return items
-            .filter { $0.name.localizedCaseInsensitiveContains(q) }
+        return live
+            .filter { it in
+                it.name.localizedCaseInsensitiveContains(q)
+                    || (it.tags ?? []).contains { $0.localizedCaseInsensitiveContains(q) }
+            }
             .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    var allMedia: [VaultItem] {
+        live.filter { $0.isMedia }.sorted { $0.date > $1.date }
+    }
+
+    var favorites: [VaultItem] {
+        live.filter { $0.isFavorite }.sorted { a, b in
+            if a.isFolder != b.isFolder { return a.isFolder }
+            return a.name.localizedStandardCompare(b.name) == .orderedAscending
+        }
+    }
+
+    var allTags: [String] {
+        Array(Set(live.flatMap { $0.tags ?? [] })).sorted()
+    }
+
+    func items(withTag tag: String) -> [VaultItem] {
+        live.filter { ($0.tags ?? []).contains(tag) }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
+
+    var notes: [VaultItem] {
+        live.filter { $0.isNote }.sorted { $0.date > $1.date }
+    }
+
+    var trashed: [VaultItem] {
+        items.filter { it in
+            guard it.deletedAt != nil else { return false }
+            if let p = it.parent, let pi = item(p), pi.deletedAt != nil, pi.deletedAt == it.deletedAt {
+                return false
+            }
+            return true
+        }
+        .sorted { ($0.deletedAt ?? .distantPast) > ($1.deletedAt ?? .distantPast) }
     }
 
     func item(_ id: UUID) -> VaultItem? {
@@ -221,6 +296,7 @@ final class VaultStore: ObservableObject {
     }
 
     var totalSize: Int64 { items.reduce(0) { $0 + $1.size } }
+    var liveFileCount: Int { live.filter { !$0.isFolder }.count }
 
     func descendants(of id: UUID) -> [UUID] {
         var out: [UUID] = []
@@ -247,7 +323,7 @@ final class VaultStore: ObservableObject {
             blocked.insert(id)
             for d in descendants(of: id) { blocked.insert(d) }
         }
-        return items
+        return live
             .filter { $0.isFolder && !blocked.contains($0.id) }
             .map { FolderChoice(item: $0, path: pathString($0)) }
             .sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
@@ -264,15 +340,73 @@ final class VaultStore: ObservableObject {
 
     func rename(_ id: UUID, to name: String) {
         let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !n.isEmpty, let i = items.firstIndex(where: { $0.id == id }) else { return }
+        guard !n.isEmpty, let i = index(of: id) else { return }
         items[i].name = n
-        if !items[i].isFolder {
+        if !items[i].isFolder && !items[i].isNote {
             items[i].ext = (n as NSString).pathExtension.lowercased()
         }
         saveIndex()
     }
 
-    func delete(_ ids: Set<UUID>) {
+    func toggleFav(_ id: UUID) {
+        guard let i = index(of: id) else { return }
+        items[i].fav = !(items[i].fav ?? false)
+        saveIndex()
+    }
+
+    func setFav(_ id: UUID, _ value: Bool) {
+        guard let i = index(of: id) else { return }
+        items[i].fav = value
+        saveIndex()
+    }
+
+    func setTags(_ id: UUID, _ tags: [String]) {
+        guard let i = index(of: id) else { return }
+        let clean = tags
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        items[i].tags = clean.isEmpty ? nil : clean
+        saveIndex()
+    }
+
+    func move(_ ids: Set<UUID>, to parent: UUID?) {
+        for id in ids {
+            guard let i = index(of: id) else { continue }
+            if items[i].isFolder, let p = parent, p == id || descendants(of: id).contains(p) { continue }
+            items[i].parent = parent
+        }
+        saveIndex()
+    }
+
+    // MARK: trash
+
+    func trash(_ ids: Set<UUID>) {
+        let now = Date()
+        var all = Set<UUID>()
+        for id in ids {
+            all.insert(id)
+            for d in descendants(of: id) { all.insert(d) }
+        }
+        for i in items.indices where all.contains(items[i].id) && items[i].deletedAt == nil {
+            items[i].deletedAt = now
+        }
+        saveIndex()
+    }
+
+    func restore(_ id: UUID) {
+        guard let it = item(id), let stamp = it.deletedAt else { return }
+        var group: Set<UUID> = [id]
+        for x in descendants(of: id) { group.insert(x) }
+        for i in items.indices where group.contains(items[i].id) && items[i].deletedAt == stamp {
+            items[i].deletedAt = nil
+        }
+        if let p = it.parent, item(p) == nil || item(p)?.deletedAt != nil, let i = index(of: id) {
+            items[i].parent = nil
+        }
+        saveIndex()
+    }
+
+    func permanentlyDelete(_ ids: Set<UUID>) {
         var all = Set<UUID>()
         for id in ids {
             all.insert(id)
@@ -288,13 +422,15 @@ final class VaultStore: ObservableObject {
         saveIndex()
     }
 
-    func move(_ ids: Set<UUID>, to parent: UUID?) {
-        for id in ids {
-            guard let i = items.firstIndex(where: { $0.id == id }) else { continue }
-            if items[i].isFolder, let p = parent, p == id || descendants(of: id).contains(p) { continue }
-            items[i].parent = parent
-        }
-        saveIndex()
+    func emptyTrash() {
+        let ids = Set(items.filter { $0.deletedAt != nil }.map { $0.id })
+        if !ids.isEmpty { permanentlyDelete(ids) }
+    }
+
+    func purgeOldTrash() {
+        let limit = Date().addingTimeInterval(-7 * 86400)
+        let old = Set(items.filter { ($0.deletedAt ?? .distantFuture) < limit }.map { $0.id })
+        if !old.isEmpty { permanentlyDelete(old) }
     }
 
     // MARK: import
@@ -370,6 +506,79 @@ final class VaultStore: ObservableObject {
         return false
     }
 
+    // MARK: incoming files from other apps ("Copy to Calc")
+
+    /// يشفّر الملف فوراً داخل صندوق الوارد ويحذف الأصل — يعمل حتى والخزنة مقفولة.
+    nonisolated static func stageIncoming(_ url: URL) {
+        let fm = FileManager.default
+        let root = rootURL(.real)
+        for sub in ["files", "thumbs", "inbox"] {
+            try? fm.createDirectory(at: root.appendingPathComponent(sub), withIntermediateDirectories: true)
+        }
+        let key = SecretStore.masterKey("mk")
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+
+        var isDir: ObjCBool = false
+        fm.fileExists(atPath: url.path, isDirectory: &isDir)
+        guard !isDir.boolValue else {
+            try? fm.removeItem(at: url)
+            return
+        }
+
+        let id = UUID()
+        let ext = url.pathExtension.lowercased()
+        let dst = root.appendingPathComponent("files").appendingPathComponent(id.uuidString)
+        do {
+            try Crypto.encryptFile(from: url, to: dst, key: key)
+            Thumbs.make(for: url, ext: ext, id: id, key: key, dir: root)
+            let attrs = try fm.attributesOfItem(atPath: url.path)
+            let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+            let item = VaultItem(id: id, name: url.lastPathComponent, isFolder: false, parent: nil, size: size, date: Date(), ext: ext)
+            let enc = JSONEncoder()
+            enc.dateEncodingStrategy = .iso8601
+            let sealed = try Crypto.encryptData(try enc.encode(item), key: key)
+            try sealed.write(to: root.appendingPathComponent("inbox").appendingPathComponent(id.uuidString + ".meta"), options: .atomic)
+        } catch {
+            try? fm.removeItem(at: dst)
+        }
+        try? fm.removeItem(at: url)
+    }
+
+    @discardableResult
+    func ingestStaged() -> Int {
+        let dir = root.appendingPathComponent("inbox")
+        guard let metas = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return 0 }
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .iso8601
+        var n = 0
+        for m in metas where m.pathExtension == "meta" {
+            defer { try? FileManager.default.removeItem(at: m) }
+            guard let enc = try? Data(contentsOf: m),
+                  let plain = try? Crypto.decryptData(enc, key: key),
+                  let item = try? dec.decode(VaultItem.self, from: plain) else { continue }
+            if FileManager.default.fileExists(atPath: fileURL(item.id).path),
+               !items.contains(where: { $0.id == item.id }) {
+                items.append(item)
+                n += 1
+            }
+        }
+        if n > 0 { saveIndex() }
+        return n
+    }
+
+    // MARK: panic
+
+    nonisolated static func wipeReal() {
+        let fm = FileManager.default
+        let r = rootURL(.real)
+        for sub in ["files", "thumbs", "inbox"] {
+            try? fm.removeItem(at: r.appendingPathComponent(sub))
+            try? fm.createDirectory(at: r.appendingPathComponent(sub), withIntermediateDirectories: true)
+        }
+        try? fm.removeItem(at: r.appendingPathComponent("index.bin"))
+    }
+
     // MARK: read
 
     func loadThumb(_ id: UUID) async -> UIImage? {
@@ -407,5 +616,73 @@ final class VaultStore: ObservableObject {
             try Crypto.decryptFile(from: src, to: dst, key: key)
         }.value
         return dst
+    }
+
+    // MARK: notes
+
+    func loadNote(_ item: VaultItem) async -> NoteContent? {
+        let key = self.key
+        let src = fileURL(item.id)
+        return await Task.detached(priority: .userInitiated) { () -> NoteContent? in
+            guard let d = try? Crypto.decryptFileToData(from: src, key: key) else { return nil }
+            return try? JSONDecoder().decode(NoteContent.self, from: d)
+        }.value
+    }
+
+    @discardableResult
+    func saveNote(id: UUID?, title: String, content: NoteContent, parent: UUID?) -> UUID? {
+        guard let data = try? JSONEncoder().encode(content) else { return nil }
+        let nid = id ?? UUID()
+        do {
+            try Crypto.encryptDataToFile(data, to: fileURL(nid), key: key)
+        } catch {
+            return nil
+        }
+        let t = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = t.isEmpty ? "ملاحظة" : t
+        if let i = index(of: nid) {
+            items[i].name = name
+            items[i].size = Int64(data.count)
+            items[i].date = Date()
+        } else {
+            items.append(VaultItem(id: nid, name: name, isFolder: false, parent: parent,
+                                   size: Int64(data.count), date: Date(), ext: "cnote"))
+        }
+        saveIndex()
+        return nid
+    }
+
+    // MARK: backup
+
+    func makeBackup(password: String) async throws -> URL {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyyMMdd-HHmm"
+        let dst = VaultStore.tempDir.appendingPathComponent("CalcBackup-" + fmt.string(from: Date()) + ".bak")
+        let snapshot = items
+        let key = self.key
+        let files = root.appendingPathComponent("files")
+        let thumbs = root.appendingPathComponent("thumbs")
+        try await Task.detached(priority: .userInitiated) { () throws -> Void in
+            try FileManager.default.createDirectory(at: VaultStore.tempDir, withIntermediateDirectories: true)
+            try Backup.export(items: snapshot, filesDir: files, thumbsDir: thumbs,
+                              vaultKey: key, password: password, to: dst)
+        }.value
+        return dst
+    }
+
+    func restoreBackup(from url: URL, password: String) async throws -> Int {
+        let key = self.key
+        let files = root.appendingPathComponent("files")
+        let thumbs = root.appendingPathComponent("thumbs")
+        let restored = try await Task.detached(priority: .userInitiated) { () throws -> [VaultItem] in
+            try Backup.restore(from: url, password: password, vaultKey: key, filesDir: files, thumbsDir: thumbs)
+        }.value
+        var added = 0
+        for it in restored where !items.contains(where: { $0.id == it.id }) {
+            items.append(it)
+            added += 1
+        }
+        saveIndex()
+        return added
     }
 }

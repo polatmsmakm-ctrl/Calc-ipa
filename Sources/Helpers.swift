@@ -1,6 +1,24 @@
 import SwiftUI
 import QuickLook
 import Photos
+import VisionKit
+import PDFKit
+
+struct URLBox: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+struct ShareBox: Identifiable {
+    let id = UUID()
+    let urls: [URL]
+}
+
+struct ViewerSpec: Identifiable {
+    let id = UUID()
+    let items: [VaultItem]
+    let start: Int
+}
 
 // MARK: - Photos cleanup (حذف الأصل بعد الاستيراد)
 
@@ -17,20 +35,18 @@ enum PhotoCleaner {
     }
 }
 
-struct URLBox: Identifiable {
-    let id = UUID()
-    let url: URL
-}
+// MARK: - PDF
 
-struct ShareBox: Identifiable {
-    let id = UUID()
-    let urls: [URL]
-}
-
-struct ViewerSpec: Identifiable {
-    let id = UUID()
-    let items: [VaultItem]
-    let start: Int
+enum PDFTools {
+    static func pdfData(from images: [UIImage]) -> Data {
+        let doc = PDFDocument()
+        for (i, img) in images.enumerated() {
+            if let page = PDFPage(image: img) {
+                doc.insert(page, at: i)
+            }
+        }
+        return doc.dataRepresentation() ?? Data()
+    }
 }
 
 // MARK: - QuickLook
@@ -101,6 +117,47 @@ struct CameraPicker: UIViewControllerRepresentable {
 
         func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
             onFinish(nil)
+        }
+    }
+}
+
+// MARK: - Document scanner
+
+struct DocumentScanner: UIViewControllerRepresentable {
+    let onFinish: ([UIImage]) -> Void
+
+    static var isSupported: Bool { VNDocumentCameraViewController.isSupported }
+
+    func makeCoordinator() -> Coord { Coord(onFinish) }
+
+    func makeUIViewController(context: Context) -> VNDocumentCameraViewController {
+        let v = VNDocumentCameraViewController()
+        v.delegate = context.coordinator
+        return v
+    }
+
+    func updateUIViewController(_ vc: VNDocumentCameraViewController, context: Context) {}
+
+    final class Coord: NSObject, VNDocumentCameraViewControllerDelegate {
+        let onFinish: ([UIImage]) -> Void
+        init(_ f: @escaping ([UIImage]) -> Void) { onFinish = f }
+
+        func documentCameraViewController(_ controller: VNDocumentCameraViewController,
+                                          didFinishWith scan: VNDocumentCameraScan) {
+            var imgs: [UIImage] = []
+            for i in 0..<scan.pageCount {
+                imgs.append(scan.imageOfPage(at: i))
+            }
+            onFinish(imgs)
+        }
+
+        func documentCameraViewControllerDidCancel(_ controller: VNDocumentCameraViewController) {
+            onFinish([])
+        }
+
+        func documentCameraViewController(_ controller: VNDocumentCameraViewController,
+                                          didFailWithError error: Error) {
+            onFinish([])
         }
     }
 }
