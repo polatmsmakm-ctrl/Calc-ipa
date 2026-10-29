@@ -1,5 +1,21 @@
 import SwiftUI
 import QuickLook
+import Photos
+
+// MARK: - Photos cleanup (حذف الأصل بعد الاستيراد)
+
+enum PhotoCleaner {
+    static func delete(_ identifiers: [String]) async {
+        guard !identifiers.isEmpty else { return }
+        let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+        guard status == .authorized || status == .limited else { return }
+        let assets = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
+        guard assets.count > 0 else { return }
+        try? await PHPhotoLibrary.shared().performChanges {
+            PHAssetChangeRequest.deleteAssets(assets)
+        }
+    }
+}
 
 struct URLBox: Identifiable {
     let id = UUID()

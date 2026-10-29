@@ -30,6 +30,7 @@ targets:
           - UIInterfaceOrientationPortrait
         NSFaceIDUsageDescription: "للتحقق من هويتك"
         NSCameraUsageDescription: "لالتقاط الصور"
+        NSPhotoLibraryUsageDescription: "لحذف الصور الأصلية بعد نقلها"
         ITSAppUsesNonExemptEncryption: false
     settings:
       base:

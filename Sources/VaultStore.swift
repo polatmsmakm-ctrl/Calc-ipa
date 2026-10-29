@@ -113,6 +113,22 @@ struct PickedFile: Transferable {
     }
 }
 
+// MARK: - Sort
+
+enum SortMode: String, CaseIterable, Identifiable {
+    case name, date, size
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .name: return "الاسم"
+        case .date: return "الأحدث"
+        case .size: return "الحجم"
+        }
+    }
+}
+
 // MARK: - Store
 
 @MainActor
@@ -177,11 +193,27 @@ final class VaultStore: ObservableObject {
 
     // MARK: queries
 
-    func children(of parent: UUID?) -> [VaultItem] {
+    func children(of parent: UUID?, sort: SortMode = .name) -> [VaultItem] {
         items.filter { $0.parent == parent }.sorted { a, b in
             if a.isFolder != b.isFolder { return a.isFolder }
-            return a.name.localizedStandardCompare(b.name) == .orderedAscending
+            switch sort {
+            case .name:
+                return a.name.localizedStandardCompare(b.name) == .orderedAscending
+            case .date:
+                return a.date > b.date
+            case .size:
+                if a.size != b.size { return a.size > b.size }
+                return a.name.localizedStandardCompare(b.name) == .orderedAscending
+            }
         }
+    }
+
+    func search(_ query: String) -> [VaultItem] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return [] }
+        return items
+            .filter { $0.name.localizedCaseInsensitiveContains(q) }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
     func item(_ id: UUID) -> VaultItem? {
@@ -267,17 +299,21 @@ final class VaultStore: ObservableObject {
 
     // MARK: import
 
-    func importURLs(_ urls: [URL], parent: UUID?) async {
+    /// يرجع الروابط التي تم استيرادها بنجاح.
+    @discardableResult
+    func importURLs(_ urls: [URL], parent: UUID?) async -> [URL] {
         busy = true
+        var done: [URL] = []
         let total = urls.count
         for (i, url) in urls.enumerated() {
             busyText = "جاري الاستيراد (\(i + 1)/\(total))"
             let scoped = url.startAccessingSecurityScopedResource()
-            await importOne(url, parent: parent)
+            if await importOne(url, parent: parent) { done.append(url) }
             if scoped { url.stopAccessingSecurityScopedResource() }
         }
         saveIndex()
         busy = false
+        return done
     }
 
     func importData(_ data: Data, name: String, parent: UUID?) async {
@@ -293,7 +329,8 @@ final class VaultStore: ObservableObject {
         try? FileManager.default.removeItem(at: dir)
     }
 
-    private func importOne(_ url: URL, parent: UUID?) async {
+    @discardableResult
+    private func importOne(_ url: URL, parent: UUID?) async -> Bool {
         var isDir: ObjCBool = false
         FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
 
@@ -304,7 +341,7 @@ final class VaultStore: ObservableObject {
             for k in kids {
                 await importOne(k, parent: folder.id)
             }
-            return
+            return true
         }
 
         let id = UUID()
@@ -328,7 +365,9 @@ final class VaultStore: ObservableObject {
 
         if let s = size {
             items.append(VaultItem(id: id, name: name, isFolder: false, parent: parent, size: s, date: Date(), ext: ext))
+            return true
         }
+        return false
     }
 
     // MARK: read

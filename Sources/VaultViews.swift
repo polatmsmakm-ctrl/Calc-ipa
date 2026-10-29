@@ -1,4 +1,5 @@
 import SwiftUI
+import Photos
 import PhotosUI
 import UniformTypeIdentifiers
 
@@ -90,6 +91,10 @@ struct FolderView: View {
     @State private var confirmDelete = false
     @State private var cover: Cover?
     @State private var sheet: SheetKind?
+    @State private var query = ""
+    @AppStorage("calc.sort") private var sortRaw: String = SortMode.name.rawValue
+
+    private var sort: SortMode { SortMode(rawValue: sortRaw) ?? .name }
 
     private let cols = [GridItem(.adaptive(minimum: 100), spacing: 12)]
 
@@ -99,12 +104,14 @@ struct FolderView: View {
     }
 
     var body: some View {
-        let list = store.children(of: parent)
+        let searching = !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let list = searching ? store.search(query) : store.children(of: parent, sort: sort)
         ScrollView {
             if list.isEmpty {
                 VStack(spacing: 10) {
-                    Image(systemName: "tray").font(.system(size: 44)).foregroundColor(.secondary)
-                    Text("فاضي — اضغط + للإضافة").foregroundColor(.secondary)
+                    Image(systemName: searching ? "magnifyingglass" : "tray")
+                        .font(.system(size: 44)).foregroundColor(.secondary)
+                    Text(searching ? "ما فيه نتائج" : "فاضي — اضغط + للإضافة").foregroundColor(.secondary)
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.top, 120)
@@ -118,8 +125,10 @@ struct FolderView: View {
         }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
+        .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "بحث")
         .toolbar { toolbarContent }
-        .photosPicker(isPresented: $showPhotos, selection: $pickerItems, maxSelectionCount: 100, matching: .any(of: [.images, .videos]))
+        .photosPicker(isPresented: $showPhotos, selection: $pickerItems, maxSelectionCount: 100,
+                      matching: .any(of: [.images, .videos]), photoLibrary: .shared())
         .onChange(of: pickerItems) { picks in importPicked(picks) }
         .fileImporter(isPresented: $showFiles, allowedContentTypes: [.item, .folder], allowsMultipleSelection: true) { result in
             if case .success(let urls) = result {
@@ -199,6 +208,15 @@ struct FolderView: View {
                 Button(selecting ? "إلغاء" : "تحديد") {
                     selecting.toggle()
                     selection.removeAll()
+                }
+                Menu {
+                    Picker("ترتيب", selection: $sortRaw) {
+                        ForEach(SortMode.allCases) { m in
+                            Text(m.title).tag(m.rawValue)
+                        }
+                    }
+                } label: {
+                    Image(systemName: "arrow.up.arrow.down.circle")
                 }
                 Menu {
                     Button { showNewFolder = true } label: { Label("مجلد جديد", systemImage: "folder.badge.plus") }
@@ -312,17 +330,23 @@ struct FolderView: View {
         guard !picks.isEmpty else { return }
         let target = parent
         pickerItems = []
+        let wipe = UserDefaults.standard.bool(forKey: "calc.delOrig")
         Task { @MainActor in
             store.busy = true
             store.busyText = "جاري التحميل…"
             var urls: [URL] = []
+            var idFor: [URL: String] = [:]
             for p in picks {
                 if let f = try? await p.loadTransferable(type: PickedFile.self) {
                     urls.append(f.url)
+                    if let id = p.itemIdentifier { idFor[f.url] = id }
                 }
             }
-            await store.importURLs(urls, parent: target)
+            let ok = await store.importURLs(urls, parent: target)
             for u in urls { try? FileManager.default.removeItem(at: u.deletingLastPathComponent()) }
+            if wipe {
+                await PhotoCleaner.delete(ok.compactMap { idFor[$0] })
+            }
         }
     }
 
@@ -529,6 +553,7 @@ struct SettingsView: View {
     @State private var confirm = ""
     @State private var msg = ""
     @State private var bio = Bio.enabled
+    @AppStorage("calc.delOrig") private var delOrig = false
 
     var body: some View {
         NavigationStack {
@@ -554,6 +579,12 @@ struct SettingsView: View {
                     } footer: {
                         Text("اضغط مطوّلاً على شاشة الأرقام في الحاسبة.")
                     }
+                }
+
+                Section {
+                    Toggle("حذف الأصل من الصور بعد الاستيراد", isOn: $delOrig)
+                } footer: {
+                    Text("iOS يطلب تأكيدك قبل الحذف، والمحذوف يبقى ٣٠ يوم في «المحذوفة مؤخراً» في الصور — احذفه منها بنفسك.")
                 }
 
                 Section {
