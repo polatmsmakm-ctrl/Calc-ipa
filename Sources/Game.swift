@@ -180,7 +180,7 @@ struct GameView: View {
     @State private var screen: Screen = .menu
     @State private var showCode = false
     @State private var bounce = false
-    @State private var best = UserDefaults.standard.integer(forKey: "dash.best")
+    @State private var best = UserDefaults.standard.integer(forKey: "run.best")
 
     var body: some View {
         ZStack {
@@ -191,7 +191,7 @@ struct GameView: View {
                 menu
             case .play:
                 DashGameView {
-                    best = UserDefaults.standard.integer(forKey: "dash.best")
+                    best = UserDefaults.standard.integer(forKey: "run.best")
                     screen = .menu
                 }
             }
@@ -269,6 +269,14 @@ struct GameView: View {
         VStack(spacing: -8) {
             outlinedText("PUFF", size: 66)
             outlinedText("DASH", size: 66)
+            Text("ZOMBIE RUN")
+                .font(.system(size: 17, weight: .black, design: .rounded))
+                .foregroundColor(.white)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 5)
+                .background(Capsule().fill(Color(red: 0.75, green: 0.18, blue: 0.22)))
+                .overlay(Capsule().stroke(G.outline, lineWidth: 2.5))
+                .padding(.top, 14)
         }
     }
 
@@ -452,159 +460,6 @@ struct CodePad: View {
         } else {
             if code.count >= 4 { Attempts.recordFail() }
             wrong("Wrong code!")
-        }
-    }
-}
-
-// MARK: - Mini game (Puff Dash)
-
-private final class DashModel {
-    var y: CGFloat = 0
-    var vy: CGFloat = 0
-    var obstacles: [CGFloat] = []
-    var spawnIn: CGFloat = 300
-    var score: Double = 0
-    var over = false
-    var started = false
-    var last: TimeInterval = 0
-    var best = UserDefaults.standard.integer(forKey: "dash.best")
-
-    let charX: CGFloat = 90
-
-    func reset() {
-        y = 0; vy = 0; obstacles = []; spawnIn = 300
-        score = 0; over = false; started = false; last = 0
-    }
-
-    func tap() {
-        if over { reset(); return }
-        started = true
-        if y <= 0.5 { vy = 700 }
-    }
-
-    func step(t: TimeInterval, width: CGFloat) {
-        if last == 0 { last = t }
-        let dt = CGFloat(min(t - last, 0.033))
-        last = t
-        guard started, !over else { return }
-
-        let speed: CGFloat = 250 + CGFloat(score) * 2.4
-        vy -= 2100 * dt
-        y += vy * dt
-        if y <= 0 { y = 0; vy = 0 }
-
-        for i in obstacles.indices { obstacles[i] -= speed * dt }
-        obstacles.removeAll { $0 < -60 }
-        spawnIn -= speed * dt
-        if spawnIn <= 0 {
-            obstacles.append(width + 50)
-            spawnIn = CGFloat.random(in: 300...520)
-        }
-        score += Double(dt) * 10
-
-        for x in obstacles where abs(x - charX) < 26 && y < 30 {
-            over = true
-            let s = Int(score)
-            if s > best {
-                best = s
-                UserDefaults.standard.set(s, forKey: "dash.best")
-            }
-        }
-    }
-}
-
-struct DashGameView: View {
-    let onExit: () -> Void
-    @State private var model = DashModel()
-
-    var body: some View {
-        ZStack(alignment: .topLeading) {
-            TimelineView(.animation) { timeline in
-                Canvas { ctx, size in
-                    model.step(t: timeline.date.timeIntervalSinceReferenceDate, width: size.width)
-                    draw(&ctx, size: size)
-                }
-            }
-            .ignoresSafeArea()
-            .contentShape(Rectangle())
-            .onTapGesture { model.tap() }
-
-            Button { onExit() } label: {
-                Image(systemName: "chevron.left.circle.fill")
-                    .font(.system(size: 36))
-                    .foregroundStyle(.white, Color.black.opacity(0.25))
-                    .padding(16)
-            }
-        }
-    }
-
-    private func draw(_ ctx: inout GraphicsContext, size: CGSize) {
-        let groundY = size.height * 0.78
-        let r: CGFloat = 26
-
-        // ground
-        ctx.fill(Path(CGRect(x: 0, y: groundY, width: size.width, height: size.height - groundY)),
-                 with: .color(G.hill1))
-        ctx.fill(Path(CGRect(x: 0, y: groundY, width: size.width, height: 8)), with: .color(G.hill2))
-
-        // obstacles (spikes)
-        for x in model.obstacles {
-            var p = Path()
-            p.move(to: CGPoint(x: x - 20, y: groundY))
-            p.addLine(to: CGPoint(x: x, y: groundY - 40))
-            p.addLine(to: CGPoint(x: x + 20, y: groundY))
-            p.closeSubpath()
-            ctx.fill(p, with: .color(Color(red: 0.95, green: 0.35, blue: 0.40)))
-            ctx.stroke(p, with: .color(G.outline), lineWidth: 3)
-        }
-
-        // character
-        let cy = groundY - r - model.y
-        let body = CGRect(x: model.charX - r, y: cy - r, width: r * 2, height: r * 2)
-        ctx.fill(Path(ellipseIn: body), with: .color(G.purple))
-        ctx.stroke(Path(ellipseIn: body), with: .color(G.outline), lineWidth: 3)
-        for dx in [-8.0, 8.0] {
-            let eye = CGRect(x: model.charX + CGFloat(dx) - 6, y: cy - 10, width: 12, height: 14)
-            ctx.fill(Path(ellipseIn: eye), with: .color(.white))
-            let pupil = CGRect(x: model.charX + CGFloat(dx) - 2, y: cy - 6, width: 5, height: 6)
-            ctx.fill(Path(ellipseIn: pupil), with: .color(G.outline))
-        }
-
-        // texts
-        ctx.draw(
-            Text("SCORE \(Int(model.score))")
-                .font(.system(size: 22, weight: .heavy, design: .rounded))
-                .foregroundColor(.white),
-            at: CGPoint(x: size.width - 80, y: 56)
-        )
-        ctx.draw(
-            Text("BEST \(model.best)")
-                .font(.system(size: 14, weight: .bold, design: .rounded))
-                .foregroundColor(.white.opacity(0.85)),
-            at: CGPoint(x: size.width - 80, y: 82)
-        )
-
-        if !model.started {
-            ctx.draw(
-                Text("TAP TO JUMP")
-                    .font(.system(size: 30, weight: .black, design: .rounded))
-                    .foregroundColor(.white),
-                at: CGPoint(x: size.width / 2, y: size.height * 0.34)
-            )
-        }
-        if model.over {
-            ctx.draw(
-                Text("GAME OVER")
-                    .font(.system(size: 40, weight: .black, design: .rounded))
-                    .foregroundColor(.white),
-                at: CGPoint(x: size.width / 2, y: size.height * 0.32)
-            )
-            ctx.draw(
-                Text("tap to retry")
-                    .font(.system(size: 18, weight: .bold, design: .rounded))
-                    .foregroundColor(.white.opacity(0.9)),
-                at: CGPoint(x: size.width / 2, y: size.height * 0.32 + 38)
-            )
         }
     }
 }
