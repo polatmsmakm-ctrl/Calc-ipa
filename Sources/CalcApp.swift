@@ -113,7 +113,7 @@ struct CalcApp: App {
                         .environmentObject(vault)
                         .environmentObject(app)
                 } else {
-                    CalculatorView()
+                    GameView()
                         .environmentObject(app)
                 }
 

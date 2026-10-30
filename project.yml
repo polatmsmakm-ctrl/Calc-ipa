@@ -19,7 +19,7 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleDisplayName: "حاسبة"
+        CFBundleDisplayName: "Puff Dash"
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UILaunchScreen:

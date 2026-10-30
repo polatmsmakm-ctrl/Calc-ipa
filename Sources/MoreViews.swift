@@ -482,7 +482,7 @@ struct SettingsTab: View {
     @State private var iconMsg = ""
 
     private let icons: [(title: String, name: String?, preview: String)] = [
-        ("حاسبة", nil, "PrevCalc"),
+        ("اللعبة", nil, "PrevCalc"),
         ("ملاحظات", "IconNotes", "PrevNotes"),
         ("طقس", "IconWeather", "PrevWeather"),
         ("ساعة", "IconClock", "PrevClock")
@@ -569,7 +569,7 @@ struct SettingsTab: View {
         } header: {
             Text("القفل")
         } footer: {
-            Text("البصمة: اضغط مطوّلاً على شاشة الأرقام في الحاسبة. القفل بالقلب والهز يشتغل من الفتح القادم. والتطبيق يقفل تلقائياً عند الخروج منه، ويحجب الشاشة أثناء تسجيل الشاشة.")
+            Text("البصمة: اضغط مطوّلاً على عنوان اللعبة (PUFF DASH) في الشاشة الرئيسية. القفل بالقلب والهز يشتغل من الفتح القادم. والتطبيق يقفل تلقائياً عند الخروج منه، ويحجب الشاشة أثناء تسجيل الشاشة.")
         }
     }
 
@@ -635,7 +635,7 @@ struct SettingsTab: View {
         } header: {
             Text("أيقونة التطبيق")
         } footer: {
-            Text("تغيّر شكل الأيقونة فقط. اسم التطبيق يبقى «حاسبة».")
+            Text("تغيّر شكل الأيقونة فقط. اسم التطبيق يبقى «Puff Dash».")
         }
     }
 
@@ -737,7 +737,7 @@ struct CodeSheet: View {
     private var explanation: String {
         switch kind {
         case .real:
-            return "تكتبه في الحاسبة وتضغط = لفتح خزنتك."
+            return "تكتبه في شاشة CODE في اللعبة وتضغط OK لفتح خزنتك."
         case .decoy:
             return "رمز ثاني يفتح خزنة وهمية منفصلة تقدر تحط فيها ملفات عادية. استخدمه لو أحد أجبرك تفتح التطبيق."
         case .panic:

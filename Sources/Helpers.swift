@@ -3,6 +3,7 @@ import QuickLook
 import Photos
 import VisionKit
 import PDFKit
+import UniformTypeIdentifiers
 
 struct URLBox: Identifiable {
     let id = UUID()
@@ -117,6 +118,38 @@ struct CameraPicker: UIViewControllerRepresentable {
 
         func imagePickerControllerDidCancel(_ picker: UIImagePickerController) {
             onFinish(nil)
+        }
+    }
+}
+
+// MARK: - Files picker (UIKit، أوثق من fileImporter)
+
+struct DocumentPicker: UIViewControllerRepresentable {
+    let folder: Bool
+    let onFinish: ([URL]) -> Void
+
+    func makeCoordinator() -> Coord { Coord(onFinish) }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let types: [UTType] = folder ? [.folder] : [.item]
+        let p = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: !folder)
+        p.allowsMultipleSelection = !folder
+        p.delegate = context.coordinator
+        return p
+    }
+
+    func updateUIViewController(_ vc: UIDocumentPickerViewController, context: Context) {}
+
+    final class Coord: NSObject, UIDocumentPickerDelegate {
+        let onFinish: ([URL]) -> Void
+        init(_ f: @escaping ([URL]) -> Void) { onFinish = f }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            onFinish(urls)
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            onFinish([])
         }
     }
 }

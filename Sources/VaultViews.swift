@@ -23,6 +23,8 @@ enum Cover: Identifiable {
     case preview(URLBox)
     case camera(UUID?)
     case scanner(UUID?)
+    case files(UUID?)
+    case folder(UUID?)
 
     var id: String {
         switch self {
@@ -30,6 +32,8 @@ enum Cover: Identifiable {
         case .preview(let b): return "p" + b.id.uuidString
         case .camera: return "camera"
         case .scanner: return "scanner"
+        case .files: return "files"
+        case .folder: return "folder"
         }
     }
 }
@@ -115,6 +119,26 @@ struct Presentations: ViewModifier {
                             f.dateFormat = "yyyyMMdd_HHmmss"
                             let name = "IMG_" + f.string(from: Date()) + ".jpg"
                             Task { await store.importData(d, name: name, parent: parent) }
+                        }
+                    }
+                    .ignoresSafeArea()
+                case .files(let parent):
+                    // asCopy: النظام ينسخ الملفات (ويحمّلها من iCloud لو لزم) إلى مجلد مؤقت عندنا
+                    DocumentPicker(folder: false) { urls in
+                        p.cover = nil
+                        guard !urls.isEmpty else { return }
+                        Task { @MainActor in
+                            await store.importURLs(urls, parent: parent)
+                            for u in urls { try? FileManager.default.removeItem(at: u) }
+                        }
+                    }
+                    .ignoresSafeArea()
+                case .folder(let parent):
+                    DocumentPicker(folder: true) { urls in
+                        p.cover = nil
+                        guard !urls.isEmpty else { return }
+                        Task { @MainActor in
+                            await store.importURLs(urls, parent: parent)
                         }
                     }
                     .ignoresSafeArea()
@@ -228,7 +252,6 @@ struct FolderView: View {
     @State private var selection = Set<UUID>()
     @State private var pickerItems: [PhotosPickerItem] = []
     @State private var showPhotos = false
-    @State private var showFiles = false
     @State private var showNewFolder = false
     @State private var newFolderName = ""
     @State private var renameTarget: VaultItem?
@@ -290,17 +313,12 @@ struct FolderView: View {
         .safeAreaInset(edge: .bottom) {
             if selecting { selectionBar }
         }
-        .photosPicker(isPresented: $showPhotos, selection: $pickerItems, maxSelectionCount: 100,
-                      matching: .any(of: [.images, .videos]), photoLibrary: .shared())
+        .background(
+            Color.clear
+                .photosPicker(isPresented: $showPhotos, selection: $pickerItems, maxSelectionCount: 100,
+                              matching: .any(of: [.images, .videos]), photoLibrary: .shared())
+        )
         .onChange(of: pickerItems) { picks in importPicked(picks) }
-        .fileImporter(isPresented: $showFiles, allowedContentTypes: [.item, .folder], allowsMultipleSelection: true) { result in
-            if case .success(let urls) = result {
-                let target = parent
-                Task { @MainActor in
-                    await store.importURLs(urls, parent: target)
-                }
-            }
-        }
         .alert("مجلد جديد", isPresented: $showNewFolder) {
             TextField("الاسم", text: $newFolderName)
             Button("إنشاء") {
@@ -351,7 +369,8 @@ struct FolderView: View {
             Button { showNewFolder = true } label: { Label("مجلد جديد", systemImage: "folder.badge.plus") }
             Button { p.sheet = .note(NoteSpec(item: nil, parent: parent)) } label: { Label("ملاحظة جديدة", systemImage: "note.text.badge.plus") }
             Button { showPhotos = true } label: { Label("من الصور", systemImage: "photo.on.rectangle") }
-            Button { showFiles = true } label: { Label("من الملفات", systemImage: "doc.badge.plus") }
+            Button { p.cover = .files(parent) } label: { Label("ملفات من تطبيق الملفات", systemImage: "doc.badge.plus") }
+            Button { p.cover = .folder(parent) } label: { Label("مجلد كامل من الملفات", systemImage: "folder.badge.gearshape") }
             if UIImagePickerController.isSourceTypeAvailable(.camera) {
                 Button { p.cover = .camera(parent) } label: { Label("تصوير", systemImage: "camera") }
             }
