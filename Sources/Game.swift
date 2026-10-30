@@ -175,7 +175,7 @@ private struct CandyButtonStyle: ButtonStyle {
 struct GameView: View {
     @EnvironmentObject var app: AppState
 
-    private enum Screen { case menu, play }
+    private enum Screen { case menu, play, snake }
 
     @State private var screen: Screen = .menu
     @State private var showCode = false
@@ -189,6 +189,10 @@ struct GameView: View {
             switch screen {
             case .menu:
                 menu
+            case .snake:
+                SnakeGameView {
+                    screen = .menu
+                }
             case .play:
                 DashGameView {
                     best = UserDefaults.standard.integer(forKey: "run.best")
@@ -225,15 +229,29 @@ struct GameView: View {
 
             Button { screen = .play } label: {
                 HStack(spacing: 10) {
-                    Image(systemName: "play.fill")
-                    Text("PLAY")
+                    Image(systemName: "figure.run")
+                    Text("ZOMBIE RUN")
                 }
-                .font(.system(size: 34, weight: .black, design: .rounded))
+                .font(.system(size: 26, weight: .black, design: .rounded))
                 .foregroundColor(.white)
-                .frame(width: 230, height: 70)
+                .frame(width: 260, height: 62)
             }
             .buttonStyle(CandyButtonStyle(top: Color(red: 0.45, green: 0.90, blue: 0.40),
                                           bottom: Color(red: 0.16, green: 0.68, blue: 0.28)))
+
+            Button { screen = .snake } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "scribble.variable")
+                    Text("SNAKE")
+                }
+                .font(.system(size: 26, weight: .black, design: .rounded))
+                .foregroundColor(.white)
+                .frame(width: 260, height: 62)
+            }
+            .buttonStyle(CandyButtonStyle(top: Color(red: 0.55, green: 0.65, blue: 1.0),
+                                          bottom: Color(red: 0.34, green: 0.40, blue: 0.92)))
+            .padding(.top, 10)
+            .padding(.bottom, 4)
 
             HStack(spacing: 14) {
                 Button { showCode = true } label: {
