@@ -19,10 +19,37 @@ enum Theme {
     }
 }
 
+private struct TabBGKey: EnvironmentKey {
+    static let defaultValue: String? = nil
+}
+
+extension EnvironmentValues {
+    var tabBG: String? {
+        get { self[TabBGKey.self] }
+        set { self[TabBGKey.self] = newValue }
+    }
+}
+
 struct AppBackground: View {
+    @Environment(\.tabBG) private var bg
+
     var body: some View {
-        LinearGradient(colors: [Theme.bgTop, Theme.bgBottom], startPoint: .top, endPoint: .bottom)
-            .ignoresSafeArea()
+        ZStack {
+            LinearGradient(colors: [Theme.bgTop, Theme.bgBottom], startPoint: .top, endPoint: .bottom)
+            if let bg {
+                GeometryReader { geo in
+                    Image(bg)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipped()
+                }
+                Color.black.opacity(0.40)
+                LinearGradient(colors: [Color.black.opacity(0.35), Color.clear, Color.black.opacity(0.55)],
+                               startPoint: .top, endPoint: .bottom)
+            }
+        }
+        .ignoresSafeArea()
     }
 }
 

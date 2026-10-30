@@ -170,12 +170,14 @@ struct VaultRoot: View {
                 FolderView(parent: nil)
                     .folderDestinations()
             }
+            .environment(\.tabBG, "BG1")
             .tabItem { Label("الملفات", systemImage: "folder.fill") }
             .tag(0)
 
             NavigationStack {
                 MediaTab()
             }
+            .environment(\.tabBG, "BG2")
             .tabItem { Label("الوسائط", systemImage: "photo.stack.fill") }
             .tag(1)
 
@@ -183,18 +185,21 @@ struct VaultRoot: View {
                 FavoritesTab()
                     .folderDestinations()
             }
+            .environment(\.tabBG, "BG3")
             .tabItem { Label("المفضلة", systemImage: "star.fill") }
             .tag(2)
 
             NavigationStack {
                 NotesTab()
             }
+            .environment(\.tabBG, "BG4")
             .tabItem { Label("الملاحظات", systemImage: "note.text") }
             .tag(3)
 
             NavigationStack {
                 SettingsTab()
             }
+            .environment(\.tabBG, "BG5")
             .tabItem { Label("الإعدادات", systemImage: "gearshape.fill") }
             .tag(4)
         }
