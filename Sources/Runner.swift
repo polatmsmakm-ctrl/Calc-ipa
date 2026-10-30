@@ -114,9 +114,11 @@ private final class RunModel {
         }
         nextCoin -= sp * dt
         if nextCoin <= 0 {
-            let h = [CGFloat(30), 95, 150].randomElement() ?? 30
+            let hs: [CGFloat] = [30, 95, 150]
+            let h: CGFloat = hs.randomElement() ?? 30
             for k in 0..<3 {
-                coins.append(Coin(x: width + 40 + CGFloat(k) * 38, h: h))
+                let cx: CGFloat = width + 40 + CGFloat(k) * 38
+                coins.append(Coin(x: cx, h: h))
             }
             nextCoin = CGFloat.random(in: 320...620)
         }
