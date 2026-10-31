@@ -157,6 +157,7 @@ final class VaultStore: ObservableObject {
     @Published private(set) var items: [VaultItem] = []
     @Published var busy = false
     @Published var busyText = ""
+    @Published var noticeText: String?
     @Published var loadFailed = false
 
     private let key: SymmetricKey
@@ -616,6 +617,30 @@ final class VaultStore: ObservableObject {
             try Crypto.decryptFile(from: src, to: dst, key: key)
         }.value
         return dst
+    }
+
+    // MARK: unzip
+
+    /// يفك ضغط ملف ZIP داخل الخزنة إلى مجلد باسم الملف، ويرجع عدد الملفات أو نص الخطأ.
+    func unzip(_ item: VaultItem) async -> String {
+        busy = true
+        busyText = "جاري فك الضغط…"
+        defer { busy = false }
+        do {
+            let src = try await exportURL(for: item)
+            let base = (item.name as NSString).deletingPathExtension
+            let work = VaultStore.tempDir.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            let dest = work.appendingPathComponent(base.isEmpty ? "ملفات" : base, isDirectory: true)
+            let n = try await Task.detached(priority: .userInitiated) {
+                try ZipReader.extract(from: src, to: dest)
+            }.value
+            await importURLs([dest], parent: item.parent)
+            try? FileManager.default.removeItem(at: work)
+            try? FileManager.default.removeItem(at: src.deletingLastPathComponent())
+            return "تم فك الضغط: \(n) ملف"
+        } catch {
+            return (error as? LocalizedError)?.errorDescription ?? "تعذر فك الضغط"
+        }
     }
 
     // MARK: notes

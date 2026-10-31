@@ -72,6 +72,13 @@ final class Presenter: ObservableObject {
             cover = .media(ViewerSpec(items: media.isEmpty ? [item] : media, start: idx))
             return
         }
+        if item.ext.lowercased() == "zip" {
+            Task { @MainActor in
+                let msg = await store.unzip(item)
+                store.noticeText = msg
+            }
+            return
+        }
         Task { @MainActor in
             store.busy = true
             store.busyText = "جاري التجهيز…"
@@ -186,6 +193,7 @@ extension View {
 
 struct VaultRoot: View {
     @EnvironmentObject var store: VaultStore
+    @EnvironmentObject var app: AppState
     @State private var tab = 0
 
     var body: some View {
@@ -231,6 +239,9 @@ struct VaultRoot: View {
         .environment(\.layoutDirection, .rightToLeft)
         .overlay {
             if store.busy { BusyOverlay(text: store.busyText) }
+        }
+        .onChange(of: store.noticeText) { t in
+            if let t { app.toast = t; store.noticeText = nil }
         }
         .alert("تعذّر فك التشفير", isPresented: Binding(get: { store.loadFailed }, set: { _ in })) {
             Button("حسناً", role: .cancel) {}
@@ -459,6 +470,12 @@ struct FolderView: View {
         Button {
             p.sheet = .move(MoveSpec(ids: [item.id], onDone: {}))
         } label: { Label("نقل", systemImage: "folder") }
+
+        if item.ext.lowercased() == "zip" {
+            Button {
+                Task { @MainActor in store.noticeText = await store.unzip(item) }
+            } label: { Label("فك الضغط", systemImage: "archivebox") }
+        }
 
         if !item.isFolder && !item.isNote {
             Button { p.share([item], store: store) } label: {

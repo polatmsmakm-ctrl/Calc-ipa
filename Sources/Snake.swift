@@ -5,6 +5,8 @@ import SwiftUI
 private final class SnakeModel {
     struct P: Equatable { var x: Int; var y: Int }
 
+    var level = 5
+    var walls = true
     var cols = 21
     var rows = 12
     var body: [P] = []
@@ -23,7 +25,7 @@ private final class SnakeModel {
     var best = UserDefaults.standard.integer(forKey: "snake.best")
     var newBest = false
 
-    var interval: TimeInterval { max(0.075, 0.15 - Double(eaten / 5) * 0.008) }
+    var interval: TimeInterval { 0.21 - 0.0175 * Double(level - 1) }
 
     func reset(cols c: Int, rows r: Int) {
         cols = c; rows = r
@@ -74,7 +76,11 @@ private final class SnakeModel {
 
     private func advance() {
         if !queue.isEmpty { dir = queue.removeFirst() }
-        let head = P(x: body[0].x + dir.x, y: body[0].y + dir.y)
+        var head = P(x: body[0].x + dir.x, y: body[0].y + dir.y)
+        if !walls {
+            head.x = (head.x + cols) % cols
+            head.y = (head.y + rows) % rows
+        }
         let eating = head == food
         let eatBonus = bonus.map { head == $0 || head == P(x: $0.x + 1, y: $0.y) || head == P(x: $0.x, y: $0.y + 1) || head == P(x: $0.x + 1, y: $0.y + 1) } ?? false
         let check = (eating || eatBonus) ? body : Array(body.dropLast())
@@ -89,7 +95,7 @@ private final class SnakeModel {
         }
         body.insert(head, at: 0)
         if eating {
-            score += 7
+            score += level
             eaten += 1
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             placeFood()
@@ -101,7 +107,7 @@ private final class SnakeModel {
                 }
             }
         } else if eatBonus {
-            score += max(10, Int(bonusLeft * 10))
+            score += level * (3 + Int(bonusLeft * 2))
             bonus = nil
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
         } else {
@@ -116,6 +122,9 @@ struct SnakeGameView: View {
     let onExit: () -> Void
     @State private var model = SnakeModel()
     @State private var ready = false
+    @State private var playing = false
+    @State private var level = UserDefaults.standard.integer(forKey: "snake.level") == 0 ? 5 : UserDefaults.standard.integer(forKey: "snake.level")
+    @State private var walls = UserDefaults.standard.object(forKey: "snake.walls") as? Bool ?? true
 
     // لون شاشة LCD الكلاسيكية
     private let lcd = Color(red: 0.62, green: 0.71, blue: 0.27)
@@ -163,13 +172,15 @@ struct SnakeGameView: View {
                         .background(lcd)
                         .clipShape(RoundedRectangle(cornerRadius: 4))
                     }
+                    .overlay { if !playing { menuView(cols: cols, rows: rows) } }
                     .frame(width: fieldW + 28, height: fieldH + 50)
                     .contentShape(Rectangle())
                     .gesture(
                         DragGesture(minimumDistance: 12).onEnded { v in swipe(v.translation) }
                     )
                     .onTapGesture {
-                        if model.over { model.reset(cols: cols, rows: rows) }
+                        if !playing { return }
+                        if model.over { playing = false }
                         else if !model.started { model.started = true }
                     }
 
@@ -195,6 +206,55 @@ struct SnakeGameView: View {
             .onAppear {
                 if !ready { model.reset(cols: cols, rows: rows); ready = true }
             }
+        }
+    }
+
+    private func menuView(cols: Int, rows: Int) -> some View {
+        VStack(spacing: 10) {
+            Text("SNAKE")
+                .font(.system(size: 24, weight: .black, design: .monospaced))
+            HStack(spacing: 14) {
+                small("◀") { level = max(1, level - 1) }
+                Text("LEVEL \(level)")
+                    .font(.system(size: 16, weight: .black, design: .monospaced))
+                    .frame(width: 110)
+                small("▶") { level = min(9, level + 1) }
+            }
+            Button { walls.toggle() } label: {
+                Text(walls ? "WALLS: ON" : "WALLS: OFF")
+                    .font(.system(size: 15, weight: .black, design: .monospaced))
+                    .padding(.horizontal, 12).padding(.vertical, 5)
+                    .overlay(Rectangle().stroke(ink, lineWidth: 2))
+            }
+            Button {
+                UserDefaults.standard.set(level, forKey: "snake.level")
+                UserDefaults.standard.set(walls, forKey: "snake.walls")
+                model.level = level
+                model.walls = walls
+                model.reset(cols: cols, rows: rows)
+                playing = true
+            } label: {
+                Text("START")
+                    .font(.system(size: 18, weight: .black, design: .monospaced))
+                    .foregroundColor(lcd)
+                    .padding(.horizontal, 26).padding(.vertical, 6)
+                    .background(ink)
+            }
+            .padding(.top, 4)
+            Text("HI \(String(format: "%04d", model.best))")
+                .font(.system(size: 12, weight: .bold, design: .monospaced))
+        }
+        .foregroundColor(ink)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(lcd)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .padding(8)
+    }
+
+    private func small(_ t: String, _ a: @escaping () -> Void) -> some View {
+        Button(action: a) {
+            Text(t).font(.system(size: 18, weight: .black)).foregroundColor(ink)
+                .frame(width: 36, height: 30).overlay(Rectangle().stroke(ink, lineWidth: 2))
         }
     }
 
@@ -314,7 +374,7 @@ struct SnakeGameView: View {
                      at: CGPoint(x: box.midX, y: box.minY + 20))
             ctx.draw(Text(m.newBest ? "NEW BEST \(m.score)" : "SCORE \(m.score)").font(.system(size: 13, weight: .bold, design: .monospaced)).foregroundColor(ink),
                      at: CGPoint(x: box.midX, y: box.minY + 42))
-            ctx.draw(Text("TAP TO RETRY").font(.system(size: 11, weight: .bold, design: .monospaced)).foregroundColor(ink),
+            ctx.draw(Text("TAP FOR MENU").font(.system(size: 11, weight: .bold, design: .monospaced)).foregroundColor(ink),
                      at: CGPoint(x: box.midX, y: box.minY + 62))
         }
     }
