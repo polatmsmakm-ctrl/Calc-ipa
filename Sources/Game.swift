@@ -209,6 +209,15 @@ struct GameView: View {
         .animation(.easeInOut(duration: 0.2), value: showCode)
         .onAppear {
             withAnimation(.easeInOut(duration: 0.7).repeatForever(autoreverses: true)) { bounce = true }
+            // أول تشغيل: لازم ينشئ كود
+            if !Passcode.isSet(.real) { showCode = true }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .deviceShaken)) { _ in
+            // الكود مخفي: يظهر بهز الجهاز وأنت في القائمة الرئيسية
+            if screen == .menu && !showCode {
+                UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+                showCode = true
+            }
         }
     }
 
@@ -254,17 +263,6 @@ struct GameView: View {
             .padding(.bottom, 4)
 
             HStack(spacing: 14) {
-                Button { showCode = true } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "key.fill")
-                        Text("CODE")
-                    }
-                    .font(.system(size: 20, weight: .heavy, design: .rounded))
-                    .foregroundColor(.white)
-                    .frame(width: 130, height: 54)
-                }
-                .buttonStyle(CandyButtonStyle(top: Color(red: 1.0, green: 0.74, blue: 0.25), bottom: G.orange))
-
                 HStack(spacing: 6) {
                     Image(systemName: "trophy.fill").foregroundColor(G.gold)
                     Text("\(best)")
@@ -479,5 +477,21 @@ struct CodePad: View {
             if code.count >= 4 { Attempts.recordFail() }
             wrong("Wrong code!")
         }
+    }
+}
+
+
+// MARK: - Shake detection
+
+extension Notification.Name {
+    static let deviceShaken = Notification.Name("deviceShaken")
+}
+
+extension UIWindow {
+    open override func motionEnded(_ motion: UIEvent.EventSubtype, with event: UIEvent?) {
+        if motion == .motionShake {
+            NotificationCenter.default.post(name: .deviceShaken, object: nil)
+        }
+        super.motionEnded(motion, with: event)
     }
 }
