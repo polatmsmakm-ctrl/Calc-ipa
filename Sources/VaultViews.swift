@@ -47,6 +47,8 @@ enum SheetKind: Identifiable {
     case share(ShareBox)
     case move(MoveSpec)
     case assistant(UUID?)
+    case askDoc(VaultItem)
+    case smartRename([VaultItem])
 
     var id: String {
         switch self {
@@ -55,6 +57,8 @@ enum SheetKind: Identifiable {
         case .share(let b): return "s" + b.id.uuidString
         case .move(let m): return "mv" + m.id.uuidString
         case .assistant: return "assistant"
+        case .askDoc(let i): return "ask" + i.id.uuidString
+        case .smartRename(let l): return "sr" + l.map { $0.id.uuidString }.joined()
         }
     }
 }
@@ -180,6 +184,12 @@ struct Presentations: ViewModifier {
                     MoveSheet(spec: m)
                 case .assistant(let parent):
                     AssistantView(parent: parent)
+                        .environmentObject(store)
+                case .askDoc(let it):
+                    DocAskView(item: it)
+                        .environmentObject(store)
+                case .smartRename(let l):
+                    SmartRenameSheet(items: l)
                         .environmentObject(store)
                 }
             }
@@ -436,8 +446,15 @@ struct FolderView: View {
     }
 
     private var selectionBar: some View {
-        HStack(spacing: 22) {
+        HStack(spacing: 18) {
             barButton("square.and.arrow.up") { p.share(selectedItems(), store: store) }
+            if store.mode == .real {
+                barButton("wand.and.stars") {
+                    let sel = selectedItems()
+                    exitSelect()
+                    p.sheet = .smartRename(sel)
+                }
+            }
             barButton("doc.on.doc") {
                 p.sheet = .move(MoveSpec(ids: selection, copy: true, onDone: { exitSelect() }))
             }
@@ -541,6 +558,13 @@ struct FolderView: View {
 
         if store.isArchive(item) {
             Button { archiveTarget = item } label: { Label("فك الضغط", systemImage: "arrow.down.doc") }
+        }
+
+        if store.mode == .real && store.canAskAI(item) {
+            Button { p.sheet = .askDoc(item) } label: { Label("اسأل Gemini عن الملف", systemImage: "sparkles") }
+            if !item.isNote {
+                Button { p.sheet = .smartRename([item]) } label: { Label("اقتراح اسم ذكي", systemImage: "wand.and.stars") }
+            }
         }
 
         if !item.isNote {

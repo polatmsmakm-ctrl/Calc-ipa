@@ -500,4 +500,55 @@ extension VaultStore {
         saveIndex()
         return moved
     }
+
+    // MARK: AI payloads
+
+    func canAskAI(_ it: VaultItem) -> Bool {
+        guard !it.isFolder else { return false }
+        let e = it.ext.lowercased()
+        return it.isNote || e == "pdf" || it.isImage || VaultStore.textExts.contains(e)
+    }
+
+    /// نص/صور ملف لإرسالها لـ Gemini (يعمل خارج الخيط الرئيسي).
+    func aiPayload(_ it: VaultItem, textLimit: Int, maxImages: Int) async -> (text: String, images: [Data]) {
+        guard canAskAI(it), it.size < 80_000_000 else { return ("", []) }
+        let key = self.key, src = fileURL(it.id), e = it.ext.lowercased(), isNote = it.isNote
+        return await Task.detached(priority: .userInitiated) { () -> (String, [Data]) in
+            guard let data = try? Crypto.decryptFileToData(from: src, key: key) else { return ("", []) }
+            func jpeg(_ d: Data, _ maxPixel: CGFloat) -> Data? {
+                guard let cg = CGImageSourceCreateWithData(d as CFData, nil) else { return nil }
+                let o = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                         kCGImageSourceCreateThumbnailWithTransform: true,
+                         kCGImageSourceThumbnailMaxPixelSize: maxPixel] as CFDictionary
+                guard let img = CGImageSourceCreateThumbnailAtIndex(cg, 0, o) else { return nil }
+                return UIImage(cgImage: img).jpegData(compressionQuality: 0.72)
+            }
+            if isNote {
+                guard let n = try? JSONDecoder().decode(NoteContent.self, from: data) else { return ("", []) }
+                let fields = n.fields.filter { !$0.secret }.map { "\($0.label): \($0.value)" }.joined(separator: "\n")
+                return (String((n.body + "\n" + fields).prefix(textLimit)), [])
+            }
+            if e == "pdf" {
+                guard let doc = PDFDocument(data: data) else { return ("", []) }
+                let text = String((doc.string ?? "").prefix(textLimit))
+                if text.trimmingCharacters(in: .whitespacesAndNewlines).count >= 200 { return (text, []) }
+                // مستند ممسوح: نرسل أول صفحات كصور
+                var imgs: [Data] = []
+                for i in 0..<min(doc.pageCount, maxImages) {
+                    if let pg = doc.page(at: i) {
+                        let r = pg.bounds(for: .mediaBox)
+                        let sc = 1300 / max(r.width, r.height)
+                        let ui = pg.thumbnail(of: CGSize(width: r.width * sc, height: r.height * sc), for: .mediaBox)
+                        if let j = ui.jpegData(compressionQuality: 0.7) { imgs.append(j) }
+                    }
+                }
+                return (text, imgs)
+            }
+            if Kind.isImage(e) {
+                if let j = jpeg(data, 1400) { return ("", [j]) }
+                return ("", [])
+            }
+            return (String(decoding: data.prefix(textLimit * 4), as: UTF8.self).prefix(textLimit).description, [])
+        }.value
+    }
 }

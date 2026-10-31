@@ -37,17 +37,24 @@ enum GeminiError: LocalizedError {
 
 enum Gemini {
     static func ask(system: String, user: String) async throws -> String {
+        try await generate(system: system, turns: [["role": "user", "parts": [["text": user]]]], json: true)
+    }
+
+    /// turns: [{"role":"user"|"model","parts":[{"text":..}|{"inline_data":{...}}]}]
+    static func generate(system: String, turns: [[String: Any]], json: Bool) async throws -> String {
         let key = GeminiConfig.key
         guard !key.isEmpty else { throw GeminiError.noKey }
         let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/\(GeminiConfig.model):generateContent")!
-        var req = URLRequest(url: url, timeoutInterval: 90)
+        var req = URLRequest(url: url, timeoutInterval: 120)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(key, forHTTPHeaderField: "x-goog-api-key")
+        var gen: [String: Any] = ["temperature": 0.3]
+        if json { gen["responseMimeType"] = "application/json" }
         let body: [String: Any] = [
             "systemInstruction": ["parts": [["text": system]]],
-            "contents": [["role": "user", "parts": [["text": user]]]],
-            "generationConfig": ["temperature": 0.2, "responseMimeType": "application/json"]
+            "contents": turns,
+            "generationConfig": gen
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
