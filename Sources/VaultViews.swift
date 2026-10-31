@@ -15,6 +15,7 @@ struct NoteSpec: Identifiable {
 struct MoveSpec: Identifiable {
     let id = UUID()
     let ids: Set<UUID>
+    var copy = false
     let onDone: () -> Void
 }
 
@@ -43,6 +44,7 @@ enum SheetKind: Identifiable {
     case tags(VaultItem)
     case share(ShareBox)
     case move(MoveSpec)
+    case assistant(UUID?)
 
     var id: String {
         switch self {
@@ -50,6 +52,7 @@ enum SheetKind: Identifiable {
         case .tags(let i): return "t" + i.id.uuidString
         case .share(let b): return "s" + b.id.uuidString
         case .move(let m): return "mv" + m.id.uuidString
+        case .assistant: return "assistant"
         }
     }
 }
@@ -62,6 +65,7 @@ final class Presenter: ObservableObject {
     @Published var sheet: SheetKind?
 
     func open(_ item: VaultItem, in list: [VaultItem], store: VaultStore) {
+        store.markOpened(item.id)
         if item.isNote {
             sheet = .note(NoteSpec(item: item, parent: item.parent))
             return
@@ -70,13 +74,6 @@ final class Presenter: ObservableObject {
             let media = list.filter { $0.isMedia }
             let idx = media.firstIndex(where: { $0.id == item.id }) ?? 0
             cover = .media(ViewerSpec(items: media.isEmpty ? [item] : media, start: idx))
-            return
-        }
-        if item.ext.lowercased() == "zip" {
-            Task { @MainActor in
-                let msg = await store.unzip(item)
-                store.noticeText = msg
-            }
             return
         }
         Task { @MainActor in
@@ -172,6 +169,9 @@ struct Presentations: ViewModifier {
                     ShareSheet(urls: b.urls)
                 case .move(let m):
                     MoveSheet(spec: m)
+                case .assistant(let parent):
+                    AssistantView(parent: parent)
+                        .environmentObject(store)
                 }
             }
     }
@@ -268,6 +268,7 @@ struct FolderView: View {
     @State private var renameTarget: VaultItem?
     @State private var renameText = ""
     @State private var query = ""
+    @State private var archiveTarget: VaultItem?
     @AppStorage("calc.sort") private var sortRaw: String = SortMode.name.rawValue
 
     private var sort: SortMode { SortMode(rawValue: sortRaw) ?? .name }
@@ -281,7 +282,7 @@ struct FolderView: View {
 
     var body: some View {
         let searching = !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let list = searching ? store.search(query) : store.children(of: parent, sort: sort)
+        let list = searching ? store.search(query, in: parent, sort: sort) : store.children(of: parent, sort: sort)
         let folders = list.filter { $0.isFolder }
         let files = list.filter { !$0.isFolder }
 
@@ -316,7 +317,7 @@ struct FolderView: View {
         .background(AppBackground())
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(parent == nil ? .large : .inline)
-        .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "بحث")
+        .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .automatic), prompt: parent == nil ? "بحث في كل الخزنة" : "بحث في هذا المجلد")
         .toolbar { toolbarContent }
         .overlay(alignment: .bottomLeading) {
             if !selecting { fab }
@@ -346,6 +347,17 @@ struct FolderView: View {
             }
             Button("إلغاء", role: .cancel) { renameTarget = nil }
         }
+        .alert("فك الضغط", isPresented: Binding(get: { archiveTarget != nil }, set: { if !$0 { archiveTarget = nil } })) {
+            Button("فك الضغط هنا") {
+                if let t = archiveTarget {
+                    Task { @MainActor in store.noticeText = await store.extractArchive(t) }
+                }
+                archiveTarget = nil
+            }
+            Button("إلغاء", role: .cancel) { archiveTarget = nil }
+        } message: {
+            Text("سيُنشأ مجلد جديد بمحتوى «\(archiveTarget?.name ?? "")». أبقِ التطبيق مفتوحاً حتى ينتهي.")
+        }
         .presentations(p)
     }
 
@@ -358,6 +370,15 @@ struct FolderView: View {
         }
         ToolbarItem(placement: .navigationBarTrailing) {
             HStack(spacing: 14) {
+                if store.mode == .real {
+                    Button { p.sheet = .assistant(parent) } label: { Image(systemName: "sparkles") }
+                }
+                if let label = store.undoLabel {
+                    Button {
+                        if let l = store.undo() { store.noticeText = "تم التراجع عن: \(l)" }
+                    } label: { Image(systemName: "arrow.uturn.backward.circle") }
+                    .accessibilityLabel("تراجع عن \(label)")
+                }
                 Menu {
                     Picker("ترتيب", selection: $sortRaw) {
                         ForEach(SortMode.allCases) { m in
@@ -366,6 +387,12 @@ struct FolderView: View {
                     }
                 } label: {
                     Image(systemName: "arrow.up.arrow.down.circle")
+                }
+                if selecting {
+                    Button("الكل") {
+                        let all = store.children(of: parent, sort: sort).map { $0.id }
+                        selection = Set(all)
+                    }
                 }
                 Button(selecting ? "إلغاء" : "تحديد") {
                     selecting.toggle()
@@ -400,8 +427,16 @@ struct FolderView: View {
     }
 
     private var selectionBar: some View {
-        HStack(spacing: 30) {
+        HStack(spacing: 22) {
             barButton("square.and.arrow.up") { p.share(selectedItems(), store: store) }
+            barButton("doc.on.doc") {
+                p.sheet = .move(MoveSpec(ids: selection, copy: true, onDone: { exitSelect() }))
+            }
+            barButton("archivebox") {
+                let ids = selection
+                exitSelect()
+                Task { @MainActor in store.noticeText = await store.makeZip(ids) }
+            }
             barButton("star") {
                 for id in selection { store.setFav(id, true) }
                 exitSelect()
@@ -446,10 +481,22 @@ struct FolderView: View {
             }
             .buttonStyle(.plain)
             .contextMenu { menu(for: item) }
+            .draggable(DragPayload(ids: [item.id]))
+            .dropDestination(for: DragPayload.self) { drops, _ in
+                let ids = Set(drops.flatMap { $0.ids }).subtracting([item.id])
+                guard !ids.isEmpty else { return false }
+                store.move(ids, to: item.id)
+                store.noticeText = "تم النقل إلى «\(item.name)»"
+                return true
+            }
         } else {
             ItemTile(item: item, selected: false, count: 0)
-                .onTapGesture { p.open(item, in: list, store: store) }
+                .onTapGesture {
+                    if store.isArchive(item) { archiveTarget = item }
+                    else { p.open(item, in: list, store: store) }
+                }
                 .contextMenu { menu(for: item) }
+                .draggable(DragPayload(ids: [item.id]))
         }
     }
 
@@ -471,10 +518,27 @@ struct FolderView: View {
             p.sheet = .move(MoveSpec(ids: [item.id], onDone: {}))
         } label: { Label("نقل", systemImage: "folder") }
 
-        if item.ext.lowercased() == "zip" {
+        Button {
+            p.sheet = .move(MoveSpec(ids: [item.id], copy: true, onDone: {}))
+        } label: { Label("نسخ إلى…", systemImage: "doc.on.doc") }
+
+        Button {
+            let id = item.id
+            Task { @MainActor in
+                let n = await store.duplicate([id], to: item.parent)
+                store.noticeText = "تم تكرار \(n) عنصر"
+            }
+        } label: { Label("تكرار", systemImage: "plus.square.on.square") }
+
+        if store.isArchive(item) {
+            Button { archiveTarget = item } label: { Label("فك الضغط", systemImage: "arrow.down.doc") }
+        }
+
+        if !item.isNote {
             Button {
-                Task { @MainActor in store.noticeText = await store.unzip(item) }
-            } label: { Label("فك الضغط", systemImage: "archivebox") }
+                let id = item.id
+                Task { @MainActor in store.noticeText = await store.makeZip([id]) }
+            } label: { Label("ضغط ZIP", systemImage: "archivebox") }
         }
 
         if !item.isFolder && !item.isNote {
@@ -827,7 +891,7 @@ struct MoveSheet: View {
             }
             .scrollContentBackground(.hidden)
             .background(AppBackground())
-            .navigationTitle("نقل إلى")
+            .navigationTitle(spec.copy ? "نسخ إلى" : "نقل إلى")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
@@ -838,7 +902,15 @@ struct MoveSheet: View {
     }
 
     private func go(_ target: UUID?) {
-        store.move(spec.ids, to: target)
+        if spec.copy {
+            let ids = spec.ids
+            Task { @MainActor in
+                let n = await store.duplicate(ids, to: target)
+                store.noticeText = "تم نسخ \(n) عنصر"
+            }
+        } else {
+            store.move(spec.ids, to: target)
+        }
         spec.onDone()
         dismiss()
     }

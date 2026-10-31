@@ -20,6 +20,8 @@ struct VaultItem: Codable, Identifiable, Hashable {
     var deletedAt: Date? = nil
     var fav: Bool? = nil
     var tags: [String]? = nil
+    var modified: Date? = nil
+    var opened: Date? = nil
 
     var isImage: Bool { !isFolder && Kind.isImage(ext) }
     var isVideo: Bool { !isFolder && Kind.isVideo(ext) }
@@ -47,15 +49,20 @@ struct NoteContent: Codable {
 }
 
 enum SortMode: String, CaseIterable, Identifiable {
-    case name, date, size
+    case name, nameDesc, date, dateOld, modified, size, sizeSmall, type
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .name: return "الاسم"
-        case .date: return "الأحدث"
-        case .size: return "الحجم"
+        case .name: return "الاسم (أ → ي)"
+        case .nameDesc: return "الاسم (ي → أ)"
+        case .date: return "تاريخ الإنشاء (الأحدث)"
+        case .dateOld: return "تاريخ الإنشاء (الأقدم)"
+        case .modified: return "تاريخ التعديل"
+        case .size: return "الحجم (الأكبر)"
+        case .sizeSmall: return "الحجم (الأصغر)"
+        case .type: return "النوع"
         }
     }
 }
@@ -148,20 +155,29 @@ struct PickedFile: Transferable {
     }
 }
 
+struct UndoEntry {
+    let label: String
+    let before: [VaultItem]
+}
+
 // MARK: - Store
 
 @MainActor
 final class VaultStore: ObservableObject {
     let mode: VaultMode
 
-    @Published private(set) var items: [VaultItem] = []
-    @Published var busy = false
+    @Published var items: [VaultItem] = []
+    @Published var busy = false {
+        didSet { UIApplication.shared.isIdleTimerDisabled = busy }
+    }
+    @Published var undoStack: [UndoEntry] = []
+    var undoSuppress = 0
     @Published var busyText = ""
     @Published var noticeText: String?
     @Published var loadFailed = false
 
-    private let key: SymmetricKey
-    private let root: URL
+    let key: SymmetricKey
+    let root: URL
     private let thumbCache = NSCache<NSString, UIImage>()
 
     nonisolated static var tempDir: URL {
@@ -189,10 +205,11 @@ final class VaultStore: ObservableObject {
     // MARK: paths
 
     private var indexURL: URL { root.appendingPathComponent("index.bin") }
-    private func fileURL(_ id: UUID) -> URL { root.appendingPathComponent("files").appendingPathComponent(id.uuidString) }
-    private func thumbURL(_ id: UUID) -> URL { root.appendingPathComponent("thumbs").appendingPathComponent(id.uuidString) }
+    func fileURL(_ id: UUID) -> URL { root.appendingPathComponent("files").appendingPathComponent(id.uuidString) }
+    func thumbURL(_ id: UUID) -> URL { root.appendingPathComponent("thumbs").appendingPathComponent(id.uuidString) }
 
     func cleanTemp() {
+        if busy { return }
         try? FileManager.default.removeItem(at: VaultStore.tempDir)
     }
 
@@ -210,7 +227,7 @@ final class VaultStore: ObservableObject {
         }
     }
 
-    private func saveIndex() {
+    func saveIndex() {
         if loadFailed { return }
         let enc = JSONEncoder()
         enc.dateEncodingStrategy = .iso8601
@@ -219,42 +236,57 @@ final class VaultStore: ObservableObject {
         try? c.write(to: indexURL, options: .atomic)
     }
 
-    private func index(of id: UUID) -> Int? {
+    func index(of id: UUID) -> Int? {
         items.firstIndex { $0.id == id }
     }
 
     // MARK: queries
 
-    private var live: [VaultItem] { items.filter { $0.deletedAt == nil } }
+    var live: [VaultItem] { items.filter { $0.deletedAt == nil } }
 
-    func children(of parent: UUID?, sort: SortMode = .name) -> [VaultItem] {
-        live.filter { $0.parent == parent }.sorted { a, b in
+    func sorted(_ list: [VaultItem], by sort: SortMode) -> [VaultItem] {
+        list.sorted { a, b in
             if a.isFolder != b.isFolder { return a.isFolder }
+            func byName(_ x: VaultItem, _ y: VaultItem) -> Bool {
+                x.name.localizedStandardCompare(y.name) == .orderedAscending
+            }
             switch sort {
-            case .name:
-                return a.name.localizedStandardCompare(b.name) == .orderedAscending
-            case .date:
-                return a.date > b.date
-            case .size:
-                if a.size != b.size { return a.size > b.size }
-                return a.name.localizedStandardCompare(b.name) == .orderedAscending
+            case .name: return byName(a, b)
+            case .nameDesc: return byName(b, a)
+            case .date: return a.date != b.date ? a.date > b.date : byName(a, b)
+            case .dateOld: return a.date != b.date ? a.date < b.date : byName(a, b)
+            case .modified:
+                let x = a.modified ?? a.date, y = b.modified ?? b.date
+                return x != y ? x > y : byName(a, b)
+            case .size: return a.size != b.size ? a.size > b.size : byName(a, b)
+            case .sizeSmall: return a.size != b.size ? a.size < b.size : byName(a, b)
+            case .type:
+                let x = a.ext.lowercased(), y = b.ext.lowercased()
+                return x != y ? x < y : byName(a, b)
             }
         }
+    }
+
+    func children(of parent: UUID?, sort: SortMode = .name) -> [VaultItem] {
+        sorted(live.filter { $0.parent == parent }, by: sort)
     }
 
     func folderCount(_ id: UUID) -> Int {
         live.filter { $0.parent == id }.count
     }
 
-    func search(_ query: String) -> [VaultItem] {
+    /// بحث بالاسم والوسوم داخل المجلد الحالي (وكل ما تحته)؛ parent = nil يعني كل الخزنة.
+    func search(_ query: String, in parent: UUID? = nil, sort: SortMode = .name) -> [VaultItem] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return [] }
-        return live
-            .filter { it in
-                it.name.localizedCaseInsensitiveContains(q)
-                    || (it.tags ?? []).contains { $0.localizedCaseInsensitiveContains(q) }
-            }
-            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        var scope: Set<UUID>? = nil
+        if let p = parent { scope = Set(descendants(of: p)) }
+        let found = live.filter { it in
+            if let sc = scope, !sc.contains(it.id) { return false }
+            return it.name.localizedCaseInsensitiveContains(q)
+                || (it.tags ?? []).contains { $0.localizedCaseInsensitiveContains(q) }
+        }
+        return sorted(found, by: sort)
     }
 
     var allMedia: [VaultItem] {
@@ -335,6 +367,7 @@ final class VaultStore: ObservableObject {
     func createFolder(_ name: String, parent: UUID?) {
         let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !n.isEmpty else { return }
+        snapshot("إنشاء مجلد")
         items.append(VaultItem(id: UUID(), name: n, isFolder: true, parent: parent, size: 0, date: Date(), ext: ""))
         saveIndex()
     }
@@ -342,7 +375,9 @@ final class VaultStore: ObservableObject {
     func rename(_ id: UUID, to name: String) {
         let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !n.isEmpty, let i = index(of: id) else { return }
+        snapshot("إعادة تسمية")
         items[i].name = n
+        items[i].modified = Date()
         if !items[i].isFolder && !items[i].isNote {
             items[i].ext = (n as NSString).pathExtension.lowercased()
         }
@@ -371,10 +406,12 @@ final class VaultStore: ObservableObject {
     }
 
     func move(_ ids: Set<UUID>, to parent: UUID?) {
+        snapshot("نقل")
         for id in ids {
             guard let i = index(of: id) else { continue }
             if items[i].isFolder, let p = parent, p == id || descendants(of: id).contains(p) { continue }
             items[i].parent = parent
+            items[i].modified = Date()
         }
         saveIndex()
     }
@@ -382,6 +419,7 @@ final class VaultStore: ObservableObject {
     // MARK: trash
 
     func trash(_ ids: Set<UUID>) {
+        snapshot("حذف")
         let now = Date()
         var all = Set<UUID>()
         for id in ids {
@@ -396,6 +434,7 @@ final class VaultStore: ObservableObject {
 
     func restore(_ id: UUID) {
         guard let it = item(id), let stamp = it.deletedAt else { return }
+        snapshot("استعادة")
         var group: Set<UUID> = [id]
         for x in descendants(of: id) { group.insert(x) }
         for i in items.indices where group.contains(items[i].id) && items[i].deletedAt == stamp {
@@ -467,7 +506,7 @@ final class VaultStore: ObservableObject {
     }
 
     @discardableResult
-    private func importOne(_ url: URL, parent: UUID?) async -> Bool {
+    func importOne(_ url: URL, parent: UUID?) async -> Bool {
         var isDir: ObjCBool = false
         FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
 
@@ -619,30 +658,6 @@ final class VaultStore: ObservableObject {
         return dst
     }
 
-    // MARK: unzip
-
-    /// يفك ضغط ملف ZIP داخل الخزنة إلى مجلد باسم الملف، ويرجع عدد الملفات أو نص الخطأ.
-    func unzip(_ item: VaultItem) async -> String {
-        busy = true
-        busyText = "جاري فك الضغط…"
-        defer { busy = false }
-        do {
-            let src = try await exportURL(for: item)
-            let base = (item.name as NSString).deletingPathExtension
-            let work = VaultStore.tempDir.appendingPathComponent(UUID().uuidString, isDirectory: true)
-            let dest = work.appendingPathComponent(base.isEmpty ? "ملفات" : base, isDirectory: true)
-            let n = try await Task.detached(priority: .userInitiated) {
-                try ZipReader.extract(from: src, to: dest)
-            }.value
-            await importURLs([dest], parent: item.parent)
-            try? FileManager.default.removeItem(at: work)
-            try? FileManager.default.removeItem(at: src.deletingLastPathComponent())
-            return "تم فك الضغط: \(n) ملف"
-        } catch {
-            return (error as? LocalizedError)?.errorDescription ?? "تعذر فك الضغط"
-        }
-    }
-
     // MARK: notes
 
     func loadNote(_ item: VaultItem) async -> NoteContent? {
@@ -669,6 +684,7 @@ final class VaultStore: ObservableObject {
             items[i].name = name
             items[i].size = Int64(data.count)
             items[i].date = Date()
+            items[i].modified = Date()
         } else {
             items.append(VaultItem(id: nid, name: name, isFolder: false, parent: parent,
                                    size: Int64(data.count), date: Date(), ext: "cnote"))
