@@ -497,6 +497,8 @@ struct AssistantView: View {
                 ToolbarItem(placement: .navigationBarLeading) { Button("إغلاق") { dismiss() } }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     HStack(spacing: 16) {
+                        Button { copyAll() } label: { Image(systemName: "doc.on.doc") }
+                            .disabled(vm.messages.isEmpty)
                         Button { vm.newChat() } label: { Image(systemName: "square.and.pencil") }
                         Button { showHistory = true } label: { Image(systemName: "clock.arrow.circlepath") }
                         Button { showSettings = true } label: { Image(systemName: "gearshape") }
@@ -551,16 +553,45 @@ struct AssistantView: View {
         Task { await vm.ask(t, store: store, parent: parent) }
     }
 
+    private func copyText(_ m: AIMessage) -> String {
+        var t = m.text
+        var names = m.items.map { $0.name }
+        for g in m.groups { names += ["—"] + g.items.map { $0.name } }
+        if !names.isEmpty { t += "\n" + names.map { "• " + $0 }.joined(separator: "\n") }
+        if let c = m.compare {
+            if !c.onlyA.isEmpty { t += "\nفقط في \(c.nameA):\n" + c.onlyA.joined(separator: "\n") }
+            if !c.onlyB.isEmpty { t += "\nفقط في \(c.nameB):\n" + c.onlyB.joined(separator: "\n") }
+            if !c.different.isEmpty { t += "\nمختلف:\n" + c.different.joined(separator: "\n") }
+        }
+        return t
+    }
+
+    private func copyAll() {
+        let all = vm.messages.map { ($0.isUser ? "أنا: " : "المساعد: ") + copyText($0) }.joined(separator: "\n\n")
+        UIPasteboard.general.string = all
+        store.noticeText = "تم نسخ المحادثة كاملة"
+    }
+
+    private func copy(_ m: AIMessage) {
+        UIPasteboard.general.string = copyText(m)
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        store.noticeText = "تم النسخ"
+    }
+
     @ViewBuilder
     private func bubble(_ m: AIMessage) -> some View {
         if m.isUser {
             Text(m.text)
+                .textSelection(.enabled)
                 .padding(10)
                 .background(RoundedRectangle(cornerRadius: 14).fill(Theme.accent.opacity(0.35)))
                 .frame(maxWidth: .infinity, alignment: .trailing)
+                .contextMenu {
+                    Button { copy(m) } label: { Label("نسخ", systemImage: "doc.on.doc") }
+                }
         } else {
             VStack(alignment: .trailing, spacing: 8) {
-                Text(m.text).frame(maxWidth: .infinity, alignment: .leading)
+                Text(m.text).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
 
                 if !m.items.isEmpty { itemList(m.items) }
                 ForEach(m.groups) { g in groupView(g) }
@@ -584,6 +615,10 @@ struct AssistantView: View {
             }
             .padding(12)
             .background(RoundedRectangle(cornerRadius: 16).fill(Color.white.opacity(0.08)))
+            .contextMenu {
+                Button { copy(m) } label: { Label("نسخ الرد", systemImage: "doc.on.doc") }
+                Button { copyAll() } label: { Label("نسخ المحادثة كاملة", systemImage: "doc.on.doc.fill") }
+            }
         }
     }
 
