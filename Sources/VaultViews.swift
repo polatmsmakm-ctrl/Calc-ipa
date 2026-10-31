@@ -326,7 +326,7 @@ struct FolderView: View {
         .background(AppBackground())
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(parent == nil ? .large : .inline)
-        .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .automatic), prompt: parent == nil ? "بحث في كل الخزنة" : "بحث في هذا المجلد")
+        .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: parent == nil ? "بحث في كل الخزنة" : "بحث في هذا المجلد")
         .toolbar { toolbarContent }
         .overlay(alignment: .bottomLeading) {
             if !selecting { fab }
