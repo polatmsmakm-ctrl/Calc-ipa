@@ -6,13 +6,13 @@ import SWCompression
 
 // MARK: - Result types
 
-struct DupGroup: Identifiable {
-    let id = UUID()
+struct DupGroup: Identifiable, Codable {
+    var id = UUID()
     var identical: Bool
     var items: [VaultItem]
 }
 
-struct CompareResult {
+struct CompareResult: Codable {
     var onlyA: [String] = []
     var onlyB: [String] = []
     var different: [String] = []

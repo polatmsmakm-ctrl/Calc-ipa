@@ -21,6 +21,7 @@ struct MoveSpec: Identifiable {
 
 enum Cover: Identifiable {
     case media(ViewerSpec)
+    case video(VaultItem)
     case preview(URLBox)
     case camera(UUID?)
     case scanner(UUID?)
@@ -30,6 +31,7 @@ enum Cover: Identifiable {
     var id: String {
         switch self {
         case .media(let s): return "m" + s.id.uuidString
+        case .video(let v): return "v" + v.id.uuidString
         case .preview(let b): return "p" + b.id.uuidString
         case .camera: return "camera"
         case .scanner: return "scanner"
@@ -70,10 +72,14 @@ final class Presenter: ObservableObject {
             sheet = .note(NoteSpec(item: item, parent: item.parent))
             return
         }
-        if item.isMedia {
-            let media = list.filter { $0.isMedia }
-            let idx = media.firstIndex(where: { $0.id == item.id }) ?? 0
-            cover = .media(ViewerSpec(items: media.isEmpty ? [item] : media, start: idx))
+        if item.isVideo {
+            cover = .video(item)          // الفيديو يُفتح لحاله: السحب يمين/يسار لا ينقل لفيديو ثاني
+            return
+        }
+        if item.isImage {
+            let imgs = list.filter { $0.isImage }
+            let idx = imgs.firstIndex(where: { $0.id == item.id }) ?? 0
+            cover = .media(ViewerSpec(items: imgs.isEmpty ? [item] : imgs, start: idx))
             return
         }
         Task { @MainActor in
@@ -112,6 +118,9 @@ struct Presentations: ViewModifier {
                 switch c {
                 case .media(let spec):
                     MediaViewer(spec: spec)
+                case .video(let item):
+                    VideoPlayerScreen(item: item)
+                        .environmentObject(store)
                 case .preview(let box):
                     QuickLookView(url: box.url) { p.cover = nil }
                         .ignoresSafeArea()

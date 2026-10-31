@@ -69,8 +69,8 @@ enum Gemini {
 
 // MARK: - Assistant model
 
-struct AIMessage: Identifiable {
-    let id = UUID()
+struct AIMessage: Identifiable, Codable {
+    var id = UUID()
     var isUser = false
     var text: String
     var items: [VaultItem] = []
@@ -82,18 +82,91 @@ struct AIMessage: Identifiable {
     var applied = false
 }
 
-struct AIPlan {
-    var folders: [(String, [UUID])] = []
-    var renames: [(UUID, String)] = []
+struct PlanGroup: Codable { var name: String; var ids: [UUID] }
+struct PlanRename: Codable { var id: UUID; var name: String }
+
+struct AIPlan: Codable {
+    var folders: [PlanGroup] = []
+    var renames: [PlanRename] = []
     var dateIDs: [UUID] = []
     var parent: UUID?
 }
 
+struct ChatSession: Identifiable, Codable {
+    var id = UUID()
+    var title: String
+    var date: Date
+    var messages: [AIMessage]
+}
+
 @MainActor
 final class Assistant: ObservableObject {
-    @Published var messages: [AIMessage] = []
+    @Published var messages: [AIMessage] = [] {
+        didSet { persist() }
+    }
     @Published var working = false
     @Published var status = ""
+    @Published var sessions: [ChatSession] = []
+    private(set) var currentID = UUID()
+    private weak var storeRef: VaultStore?
+    private var attached = false
+
+    // MARK: chats persistence (مشفّرة بمفتاح الخزنة)
+
+    private var chatsURL: URL? { storeRef?.root.appendingPathComponent("chats.bin") }
+
+    func attach(_ store: VaultStore) {
+        guard !attached else { return }
+        attached = true
+        storeRef = store
+        if let u = chatsURL, let enc = try? Data(contentsOf: u),
+           let plain = try? Crypto.decryptData(enc, key: store.key) {
+            let d = JSONDecoder()
+            d.dateDecodingStrategy = .iso8601
+            sessions = (try? d.decode([ChatSession].self, from: plain)) ?? []
+        }
+        // افتح آخر محادثة تلقائياً
+        if let last = sessions.sorted(by: { $0.date > $1.date }).first {
+            currentID = last.id
+            messages = last.messages
+        }
+    }
+
+    private func persist() {
+        guard attached, let store = storeRef, let u = chatsURL else { return }
+        if messages.isEmpty {
+            sessions.removeAll { $0.id == currentID }
+        } else {
+            let title = String((messages.first(where: { $0.isUser })?.text ?? "محادثة").prefix(40))
+            if let i = sessions.firstIndex(where: { $0.id == currentID }) {
+                sessions[i].messages = messages
+                sessions[i].date = Date()
+            } else {
+                sessions.append(ChatSession(id: currentID, title: title, date: Date(), messages: messages))
+            }
+        }
+        let e = JSONEncoder()
+        e.dateEncodingStrategy = .iso8601
+        if let data = try? e.encode(sessions), let enc = try? Crypto.encryptData(data, key: store.key) {
+            try? enc.write(to: u, options: .atomic)
+        }
+    }
+
+    func newChat() {
+        currentID = UUID()
+        messages = []
+    }
+
+    func open(_ s: ChatSession) {
+        currentID = s.id
+        messages = s.messages
+    }
+
+    func delete(_ id: UUID) {
+        sessions.removeAll { $0.id == id }
+        if id == currentID { currentID = UUID(); messages = [] }
+        else { persist() }
+    }
 
     private var shortMap: [Int: UUID] = [:]
 
@@ -117,7 +190,6 @@ final class Assistant: ObservableObject {
     Never invent ids. Keep "say" short.
     """
 
-    func reset() { messages = [] }
 
     private func buildIndex(_ store: VaultStore) -> String {
         shortMap = [:]
@@ -162,7 +234,8 @@ final class Assistant: ObservableObject {
         status = "Gemini يفكر…"
         defer { working = false; status = "" }
         do {
-            let user = "INDEX:\n\(buildIndex(store))\n\nUSER REQUEST:\n\(t)"
+            let hist = messages.dropLast().suffix(8).map { ($0.isUser ? "USER: " : "ASSISTANT: ") + String($0.text.prefix(300)) }.joined(separator: "\n")
+            let user = "INDEX:\n\(buildIndex(store))\n\nRECENT CONVERSATION:\n\(hist)\n\nUSER REQUEST:\n\(t)"
             let raw = try await Gemini.ask(system: system, user: user)
             await handle(raw, store: store, parent: parent, original: t)
         } catch {
@@ -213,18 +286,18 @@ final class Assistant: ObservableObject {
                 messages.append(AIMessage(text: "حدّد المجلدين بالاسم عشان أقارنهم"))
             }
         case "organize":
-            let groups: [(String, [UUID])] = ((args["groups"] as? [[String: Any]]) ?? []).compactMap { g in
+            let groups: [PlanGroup] = ((args["groups"] as? [[String: Any]]) ?? []).compactMap { g in
                 guard let f = g["folder"] as? String else { return nil }
                 let i = ids(g["ids"])
-                return i.isEmpty ? nil : (f, i)
+                return i.isEmpty ? nil : PlanGroup(name: f, ids: i)
             }
             var m = AIMessage(text: say.isEmpty ? "هذا اقتراح التنظيم" : say)
             if groups.isEmpty { m.text = "ما لقيت ملفات مناسبة للتنظيم" } else { m.plan = AIPlan(folders: groups, parent: parent) }
             messages.append(m)
         case "rename":
-            let rs: [(UUID, String)] = ((args["renames"] as? [[String: Any]]) ?? []).compactMap { r in
+            let rs: [PlanRename] = ((args["renames"] as? [[String: Any]]) ?? []).compactMap { r in
                 guard let id = one(r["id"]), let n = r["name"] as? String, !n.isEmpty else { return nil }
-                return (id, n)
+                return PlanRename(id: id, name: n)
             }
             var m = AIMessage(text: say.isEmpty ? "هذي الأسماء المقترحة" : say)
             if rs.isEmpty { m.text = "ما طلع اقتراح لإعادة التسمية" } else { m.plan = AIPlan(renames: rs) }
@@ -322,12 +395,12 @@ final class Assistant: ObservableObject {
         guard let i = messages.firstIndex(where: { $0.id == id }), let plan = messages[i].plan, !messages[i].applied else { return }
         var report = ""
         if !plan.folders.isEmpty {
-            let n = store.organize(plan.folders, under: plan.parent)
+            let n = store.organize(plan.folders.map { ($0.name, $0.ids) }, under: plan.parent)
             report = "تم نقل \(n) عنصر"
         }
         if !plan.renames.isEmpty {
             store.beginGroup("إعادة تسمية")
-            for (id, name) in plan.renames { store.rename(id, to: name) }
+            for r in plan.renames { store.rename(r.id, to: r.name) }
             store.endGroup()
             report = "تمت إعادة تسمية \(plan.renames.count) عنصر"
         }
@@ -357,6 +430,7 @@ struct AssistantView: View {
     @State private var input = ""
     @State private var showSettings = false
     @State private var hasKey = !GeminiConfig.key.isEmpty
+    @State private var showHistory = false
 
     private let chips: [(String, String)] = [
         ("أكبر 50 ملف", "largest"), ("الملفات المكررة", "dups"),
@@ -422,8 +496,16 @@ struct AssistantView: View {
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) { Button("إغلاق") { dismiss() } }
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                    HStack(spacing: 16) {
+                        Button { vm.newChat() } label: { Image(systemName: "square.and.pencil") }
+                        Button { showHistory = true } label: { Image(systemName: "clock.arrow.circlepath") }
+                        Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                    }
                 }
+            }
+            .task { vm.attach(store) }
+            .sheet(isPresented: $showHistory) {
+                ChatHistoryView(vm: vm)
             }
             .sheet(isPresented: $showSettings, onDismiss: { hasKey = !GeminiConfig.key.isEmpty }) {
                 AISettingsView()
@@ -559,15 +641,15 @@ struct AssistantView: View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(Array(p.folders.enumerated()), id: \.offset) { _, g in
                 VStack(alignment: .leading, spacing: 2) {
-                    Label(g.0, systemImage: "folder.fill").font(.footnote.weight(.bold))
-                    ForEach(g.1.prefix(12), id: \.self) { id in
+                    Label(g.name, systemImage: "folder.fill").font(.footnote.weight(.bold))
+                    ForEach(g.ids.prefix(12), id: \.self) { id in
                         if let it = store.item(id) { Text("• " + it.name).font(.caption).lineLimit(1) }
                     }
-                    if g.1.count > 12 { Text("… و\(g.1.count - 12)").font(.caption) }
+                    if g.ids.count > 12 { Text("… و\(g.ids.count - 12)").font(.caption) }
                 }
             }
             ForEach(Array(p.renames.prefix(30).enumerated()), id: \.offset) { _, r in
-                if let it = store.item(r.0) { Text("\(it.name) ← \(r.1)").font(.caption).lineLimit(2) }
+                if let it = store.item(r.id) { Text("\(it.name) ← \(r.name)").font(.caption).lineLimit(2) }
             }
             if !p.dateIDs.isEmpty { Text("\(p.dateIDs.count) صورة ستُسمّى بتاريخ ووقت الالتقاط").font(.caption) }
         }
@@ -616,5 +698,44 @@ struct AISettingsView: View {
             }
         }
         .environment(\.layoutDirection, .rightToLeft)
+    }
+}
+
+
+struct ChatHistoryView: View {
+    @ObservedObject var vm: Assistant
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if vm.sessions.isEmpty {
+                    Text("ما فيه محادثات محفوظة بعد").foregroundColor(.secondary)
+                }
+                ForEach(vm.sessions.sorted { $0.date > $1.date }) { s in
+                    Button {
+                        vm.open(s)
+                        dismiss()
+                    } label: {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(s.title).font(.body).lineLimit(1)
+                            Text("\(s.messages.count) رسالة • \(s.date.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption).foregroundColor(.secondary)
+                        }
+                    }
+                    .foregroundColor(.primary)
+                    .swipeActions {
+                        Button(role: .destructive) { vm.delete(s.id) } label: { Label("حذف", systemImage: "trash") }
+                    }
+                }
+            }
+            .navigationTitle("المحادثات السابقة")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) { Button("تم") { dismiss() } }
+            }
+        }
+        .environment(\.layoutDirection, .rightToLeft)
+        .preferredColorScheme(.dark)
     }
 }
